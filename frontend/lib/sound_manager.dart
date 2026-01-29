@@ -76,6 +76,7 @@ class SoundManager {
   /// Vibrate for incoming calls
   Future<void> vibrateForIncomingCall() async {
     try {
+      if (kIsWeb) return;
       bool? hasVibrator = await Vibration.hasVibrator();
       if (hasVibrator == true) {
         // Vibrate in a pattern: vibrate, pause, vibrate, pause...
@@ -89,6 +90,7 @@ class SoundManager {
   /// Vibrate once for call actions
   Future<void> vibrateOnce() async {
     try {
+      if (kIsWeb) return;
       bool? hasVibrator = await Vibration.hasVibrator();
       if (hasVibrator == true) {
         await Vibration.vibrate(duration: 100);
@@ -102,7 +104,13 @@ class SoundManager {
   void stopAll() {
     _isPlayingRingtone = false;
     _audioPlayer.stop();
-    Vibration.cancel();
+    if (!kIsWeb) {
+      try {
+        Vibration.cancel();
+      } catch (e) {
+        debugPrint('Could not cancel vibration: $e');
+      }
+    }
   }
 
   /// Dispose resources

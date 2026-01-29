@@ -3,6 +3,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'call_service.dart';
 import 'calling_interface.dart';
 import 'sound_manager.dart';
+import 'background_call_service.dart';
 
 /// Main calling screen with UI for making and receiving calls
 class CallScreen extends StatefulWidget {
@@ -44,12 +45,27 @@ class _CallScreenState extends State<CallScreen> {
   /// Initialize the CallService and set up listeners
   Future<void> _initializeCallService() async {
     try {
+      // Connect background service to server
+      BackgroundCallService().connectToServer(
+        widget.userId,
+        serverUrl: kSignalingServerUrl,
+      );
+      
       // Set up stream listeners
       _callService.callStateStream.listen((state) {
         setState(() {
           // Show calling interface when in any active call state
           _showCallingInterface = state['callState'] != CallState.idle;
         });
+        
+        // Update background service notifications
+        if (state['callState'] == CallState.connected) {
+          BackgroundCallService().showCallConnectedNotification(
+            _callService.remoteUserId ?? 'Unknown'
+          );
+        } else if (state['callState'] == CallState.idle) {
+          BackgroundCallService().clearNotifications();
+        }
       });
 
       _callService.incomingCallStream.listen((callData) {

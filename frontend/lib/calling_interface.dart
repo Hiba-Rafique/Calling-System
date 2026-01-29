@@ -23,6 +23,7 @@ class CallingInterface extends StatefulWidget {
 class _CallingInterfaceState extends State<CallingInterface>
     with TickerProviderStateMixin {
   final CallService _callService = CallService();
+  final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   late AnimationController _pulseController;
   late AnimationController _fadeController;
   late Animation<double> _pulseAnimation;
@@ -31,7 +32,20 @@ class _CallingInterfaceState extends State<CallingInterface>
   @override
   void initState() {
     super.initState();
+    _initializeRenderer();
     _setupAnimations();
+  }
+
+  Future<void> _initializeRenderer() async {
+    await _remoteRenderer.initialize();
+    _remoteRenderer.srcObject = _callService.remoteStream;
+
+    _callService.remoteStreamStream.listen((stream) {
+      _remoteRenderer.srcObject = stream;
+      if (mounted) {
+        setState(() {});
+      }
+    });
   }
 
   void _setupAnimations() {
@@ -69,6 +83,7 @@ class _CallingInterfaceState extends State<CallingInterface>
   void dispose() {
     _pulseController.dispose();
     _fadeController.dispose();
+    _remoteRenderer.dispose();
     super.dispose();
   }
 
@@ -125,6 +140,20 @@ class _CallingInterfaceState extends State<CallingInterface>
         opacity: _fadeAnimation,
         child: Stack(
           children: [
+            Positioned(
+              left: 0,
+              top: 0,
+              width: 1,
+              height: 1,
+              child: Opacity(
+                opacity: 0,
+                child: RTCVideoView(
+                  _remoteRenderer,
+                  mirror: false,
+                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                ),
+              ),
+            ),
             // Background gradient
             Container(
               decoration: BoxDecoration(

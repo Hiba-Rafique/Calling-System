@@ -34,6 +34,9 @@ dependencies:
   socket_io_client: ^3.1.4
   audioplayers: ^5.2.1
   vibration: ^2.0.0
+  # Background calling dependencies
+  flutter_local_notifications: ^17.2.3
+  permission_handler: ^11.3.1
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.

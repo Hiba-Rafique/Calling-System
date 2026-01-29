@@ -1,9 +1,17 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'registration_screen.dart';
 import 'call_screen.dart';
 import 'call_service.dart';
+import 'background_call_service.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  if (!kIsWeb) {
+    await BackgroundCallService().initialize();
+  }
+  
   runApp(const CallingSystemApp());
 }
 
@@ -51,20 +59,40 @@ class _AppNavigatorState extends State<AppNavigator> {
       final callService = CallService();
       await callService.initialize(userId);
       
-      setState(() {
-        _registeredUserId = userId;
-        _isInitializing = false;
-      });
-    } catch (e) {
-      setState(() {
-        _isInitializing = false;
-      });
-      
       if (mounted) {
+        setState(() {
+          _registeredUserId = userId;
+          _isInitializing = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isInitializing = false;
+        });
+        
+        String errorMessage = 'Failed to connect';
+        
+        // Handle specific errors
+        if (e.toString().contains('NotAllowedError') || 
+            e.toString().contains('getUserMedia')) {
+          errorMessage = 'Microphone permission denied. Please allow microphone access in app settings.';
+        } else if (e.toString().contains('connection') || 
+                   e.toString().contains('WebSocket')) {
+          errorMessage = 'Cannot connect to server. Please check your internet connection.';
+        }
+        
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Failed to connect: ${e.toString()}'),
+            content: Text(errorMessage),
             backgroundColor: Colors.red,
+            duration: Duration(seconds: 5),
+            action: SnackBarAction(
+              label: 'Dismiss',
+              onPressed: () {
+                ScaffoldMessenger.of(context).hideCurrentSnackBar();
+              },
+            ),
           ),
         );
       }

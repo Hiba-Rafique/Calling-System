@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'sound_manager.dart';
+
+const String kSignalingServerUrl = 'https://rjsw7olwsc3y.share.zrok.io';
 
 /// CallService manages WebRTC connections and Socket.IO signaling for voice calls
 class CallService {
@@ -52,7 +55,7 @@ class CallService {
   MediaStream? get remoteStream => _remoteStream;
 
   /// Initialize the service with user ID and connect to signaling server
-  Future<void> initialize(String userId, {String serverUrl = 'http://localhost:5000'}) async {
+  Future<void> initialize(String userId, {String serverUrl = kSignalingServerUrl}) async {
     _currentUserId = userId;
     
     // Connect to Socket.IO server
@@ -144,25 +147,70 @@ class CallService {
         debugPrint('ICE candidate generated');
         _sendIceCandidate(candidate);
       };
+
+      _peerConnection!.onIceConnectionState = (RTCIceConnectionState state) {
+        debugPrint('ICE connection state: $state');
+        if ((_callState == CallState.connecting || _callState == CallState.dialing) &&
+            (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+                state == RTCIceConnectionState.RTCIceConnectionStateCompleted)) {
+          _updateCallState(CallState.connected);
+          SoundManager().playCallConnectedSound();
+        }
+      };
+
+      _peerConnection!.onConnectionState = (RTCPeerConnectionState state) {
+        debugPrint('Peer connection state: $state');
+        if ((_callState == CallState.connecting || _callState == CallState.dialing) &&
+            state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+          _updateCallState(CallState.connected);
+          SoundManager().playCallConnectedSound();
+        }
+      };
       
       _peerConnection!.onTrack = (RTCTrackEvent event) {
         debugPrint('Remote track added');
         if (event.streams.isNotEmpty) {
           _remoteStream = event.streams[0];
           _remoteStreamController.add(_remoteStream);
+          final remoteTrackInfo = _remoteStream!
+              .getTracks()
+              .map((t) => '${t.kind}(enabled=${t.enabled})')
+              .toList();
+          debugPrint('Remote tracks: $remoteTrackInfo');
+          if (_callState == CallState.connecting) {
+            _updateCallState(CallState.connected);
+            SoundManager().playCallConnectedSound();
+          }
         }
       };
       
+      if (!kIsWeb) {
+        final micStatus = await Permission.microphone.request();
+        if (!micStatus.isGranted) {
+          throw Exception('Microphone permission denied');
+        }
+      }
+
       // Get local audio stream
       _localStream = await navigator.mediaDevices.getUserMedia({
-        'audio': true,
+        'audio': {
+          'echoCancellation': true,
+          'noiseSuppression': true,
+          'autoGainControl': true,
+        },
         'video': false,
       });
       
       // Add local tracks to peer connection
-      _localStream!.getTracks().forEach((track) async {
+      for (final track in _localStream!.getTracks()) {
         await _peerConnection!.addTrack(track, _localStream!);
-      });
+      }
+
+      final localTrackInfo = _localStream!
+          .getTracks()
+          .map((t) => '${t.kind}(enabled=${t.enabled})')
+          .toList();
+      debugPrint('Local tracks: $localTrackInfo');
       
       debugPrint('WebRTC initialized successfully');
     } catch (e) {
@@ -199,7 +247,10 @@ class CallService {
       });
       
       // Create offer
-      RTCSessionDescription offer = await _peerConnection!.createOffer();
+      RTCSessionDescription offer = await _peerConnection!.createOffer({
+        'offerToReceiveAudio': 1,
+        'offerToReceiveVideo': 0,
+      });
       
       // Set local description
       await _peerConnection!.setLocalDescription(offer);
@@ -249,7 +300,10 @@ class CallService {
       await _processBufferedIceCandidates();
       
       // Now create answer
-      RTCSessionDescription answer = await _peerConnection!.createAnswer();
+      RTCSessionDescription answer = await _peerConnection!.createAnswer({
+        'offerToReceiveAudio': 1,
+        'offerToReceiveVideo': 0,
+      });
       
       // Set local description
       await _peerConnection!.setLocalDescription(answer);
@@ -259,6 +313,18 @@ class CallService {
         'to': from, // Backend expects 'to'
         'signal': answer.toMap(), // Backend expects 'signal'
       });
+
+      if (!kIsWeb) {
+        try {
+          final audioTracks = _localStream?.getAudioTracks() ?? [];
+          if (audioTracks.isNotEmpty) {
+            await Helper.setMicrophoneMute(false, audioTracks.first);
+          }
+          await Helper.setSpeakerphoneOn(true);
+        } catch (e) {
+          debugPrint('Audio route setup failed: $e');
+        }
+      }
       
       debugPrint('Call accepted from: $from');
     } catch (e) {
@@ -322,6 +388,18 @@ class CallService {
       await _peerConnection!.setRemoteDescription(
         RTCSessionDescription(sdp, type)
       );
+
+      if (!kIsWeb) {
+        try {
+          final audioTracks = _localStream?.getAudioTracks() ?? [];
+          if (audioTracks.isNotEmpty) {
+            await Helper.setMicrophoneMute(false, audioTracks.first);
+          }
+          await Helper.setSpeakerphoneOn(true);
+        } catch (e) {
+          debugPrint('Audio route setup failed: $e');
+        }
+      }
       
       debugPrint('Call answered successfully');
     } catch (e) {
@@ -353,7 +431,8 @@ class CallService {
       debugPrint('Received ICE candidate data: $candidateData');
       
       // Check if remote description is set before adding ICE candidates
-      if (_peerConnection?.getRemoteDescription() == null) {
+      final remoteDesc = await _peerConnection?.getRemoteDescription();
+      if (remoteDesc == null) {
         debugPrint('Remote description not set yet, buffering ICE candidate');
         // Buffer the candidate for later
         _bufferedIceCandidates.add(candidateData);

@@ -203,7 +203,7 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   /// Initiate a call to another user
-  Future<void> _makeCall() async {
+  Future<void> _makeCall({required bool video}) async {
     final targetUserId = _targetUserIdController.text.trim();
     
     if (targetUserId.isEmpty) {
@@ -220,8 +220,8 @@ class _CallScreenState extends State<CallScreen> {
       setState(() {
         _currentCallTarget = targetUserId;
       });
-      
-      await _callService.callUser(targetUserId);
+
+      await _callService.callUser(targetUserId, video: video);
       _targetUserIdController.clear();
     } catch (e) {
       setState(() {
@@ -449,12 +449,12 @@ class _CallScreenState extends State<CallScreen> {
                                   contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                                 ),
                                 textInputAction: TextInputAction.go,
-                                onSubmitted: (_) => _makeCall(),
+                                onSubmitted: (_) => _makeCall(video: false),
                               ),
                             ),
                             SizedBox(width: 12),
                             ElevatedButton(
-                              onPressed: _makeCall,
+                              onPressed: () => _makeCall(video: false),
                               style: ElevatedButton.styleFrom(
                                 backgroundColor: Colors.green,
                                 foregroundColor: Colors.white,
@@ -464,6 +464,19 @@ class _CallScreenState extends State<CallScreen> {
                                 ),
                               ),
                               child: Icon(Icons.call),
+                            ),
+                            SizedBox(width: 12),
+                            ElevatedButton(
+                              onPressed: () => _makeCall(video: true),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.blue,
+                                foregroundColor: Colors.white,
+                                padding: EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                              ),
+                              child: Icon(Icons.videocam),
                             ),
                           ],
                         );
@@ -481,13 +494,13 @@ class _CallScreenState extends State<CallScreen> {
                                 contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                               ),
                               textInputAction: TextInputAction.go,
-                              onSubmitted: (_) => _makeCall(),
+                              onSubmitted: (_) => _makeCall(video: false),
                             ),
                             SizedBox(height: 12),
                             SizedBox(
                               width: double.infinity,
                               child: ElevatedButton(
-                                onPressed: _makeCall,
+                                onPressed: () => _makeCall(video: false),
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: Colors.green,
                                   foregroundColor: Colors.white,
@@ -501,7 +514,30 @@ class _CallScreenState extends State<CallScreen> {
                                   children: [
                                     Icon(Icons.call),
                                     SizedBox(width: 8),
-                                    Text('Call'),
+                                    Text('Voice Call'),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            SizedBox(height: 12),
+                            SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton(
+                                onPressed: () => _makeCall(video: true),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.blue,
+                                  foregroundColor: Colors.white,
+                                  padding: EdgeInsets.symmetric(vertical: 16),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(Icons.videocam),
+                                    SizedBox(width: 8),
+                                    Text('Video Call'),
                                   ],
                                 ),
                               ),

@@ -24,6 +24,7 @@ class _CallingInterfaceState extends State<CallingInterface>
     with TickerProviderStateMixin {
   final CallService _callService = CallService();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
+  final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
   late AnimationController _pulseController;
   late AnimationController _fadeController;
   late Animation<double> _pulseAnimation;
@@ -38,10 +39,19 @@ class _CallingInterfaceState extends State<CallingInterface>
 
   Future<void> _initializeRenderer() async {
     await _remoteRenderer.initialize();
+    await _localRenderer.initialize();
     _remoteRenderer.srcObject = _callService.remoteStream;
+    _localRenderer.srcObject = _callService.localStream;
 
     _callService.remoteStreamStream.listen((stream) {
       _remoteRenderer.srcObject = stream;
+      if (mounted) {
+        setState(() {});
+      }
+    });
+
+    _callService.localStreamStream.listen((stream) {
+      _localRenderer.srcObject = stream;
       if (mounted) {
         setState(() {});
       }
@@ -96,6 +106,7 @@ class _CallingInterfaceState extends State<CallingInterface>
     _pulseController.dispose();
     _fadeController.dispose();
     _remoteRenderer.dispose();
+    _localRenderer.dispose();
     super.dispose();
   }
 
@@ -152,22 +163,39 @@ class _CallingInterfaceState extends State<CallingInterface>
         opacity: _fadeAnimation,
         child: Stack(
           children: [
-            Positioned(
-              left: 0,
-              top: 0,
-              width: 1,
-              height: 1,
-              child: Opacity(
-                opacity: 0,
+            if (_callService.isVideoCall)
+              Positioned.fill(
                 child: RTCVideoView(
                   _remoteRenderer,
                   mirror: false,
-                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
                 ),
               ),
-            ),
+
+            if (_callService.isVideoCall)
+              Positioned(
+                right: 16,
+                top: 80,
+                width: 120,
+                height: 160,
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: Colors.black,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: RTCVideoView(
+                    _localRenderer,
+                    mirror: true,
+                    objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                  ),
+                ),
+              ),
+
             // Background gradient
-            Container(
+            if (!_callService.isVideoCall)
+              Container(
               decoration: BoxDecoration(
                 gradient: LinearGradient(
                   begin: Alignment.topCenter,
@@ -178,7 +206,7 @@ class _CallingInterfaceState extends State<CallingInterface>
                   ],
                 ),
               ),
-            ),
+              ),
             
             // Main content
             SafeArea(
@@ -311,6 +339,22 @@ class _CallingInterfaceState extends State<CallingInterface>
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                       children: [
+                        if (_callService.callState == CallState.connected &&
+                            _callService.isVideoCall)
+                          _buildControlButton(
+                            icon: _callService.isCameraOn
+                                ? Icons.videocam
+                                : Icons.videocam_off,
+                            onPressed: () async {
+                              await SoundManager().vibrateOnce();
+                              await _callService.toggleCamera();
+                              if (mounted) {
+                                setState(() {});
+                              }
+                            },
+                            backgroundColor: Colors.grey[800]!,
+                          ),
+
                         // Speaker button (only when connected)
                         if (_callService.callState == CallState.connected)
                           _buildControlButton(
@@ -349,6 +393,20 @@ class _CallingInterfaceState extends State<CallingInterface>
                           backgroundColor: Colors.red,
                           iconSize: 32,
                         ),
+
+                        if (_callService.callState == CallState.connected &&
+                            _callService.isVideoCall)
+                          _buildControlButton(
+                            icon: Icons.cameraswitch,
+                            onPressed: () async {
+                              await SoundManager().vibrateOnce();
+                              await _callService.switchCamera();
+                              if (mounted) {
+                                setState(() {});
+                              }
+                            },
+                            backgroundColor: Colors.grey[800]!,
+                          ),
                         
                         // Extra space for symmetry when not connected
                         if (_callService.callState != CallState.connected)

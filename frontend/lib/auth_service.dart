@@ -1,26 +1,44 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:hive/hive.dart';
 
 class AuthService {
+  static const String _boxName = 'auth';
   static const String _tokenKey = 'auth_token';
+  static const String _meKey = 'auth_me';
   static const String _defaultFallbackBaseUrl = 'http://localhost:5000';
 
+  Box<dynamic> _box() {
+    return Hive.box<dynamic>(_boxName);
+  }
+
   Future<void> saveToken(String token) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_tokenKey, token);
+    await _box().put(_tokenKey, token);
   }
 
   Future<String?> getToken() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_tokenKey);
+    final token = _box().get(_tokenKey);
+    return token is String ? token : null;
   }
 
   Future<void> clearToken() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_tokenKey);
+    await _box().delete(_tokenKey);
+    await _box().delete(_meKey);
+  }
+
+  Future<void> saveMe(Map<String, dynamic> me) async {
+    await _box().put(_meKey, me);
+  }
+
+  Future<Map<String, dynamic>?> getCachedMe() async {
+    final val = _box().get(_meKey);
+    if (val is Map) {
+      return Map<String, dynamic>.from(val);
+    }
+    return null;
   }
 
   Uri _uri(String baseUrl, String path) {
@@ -47,19 +65,22 @@ class AuthService {
     Future<http.Response> Function(String baseUrl) request, {
     required String primaryBaseUrl,
     String fallbackBaseUrl = _defaultFallbackBaseUrl,
+    Duration timeout = const Duration(seconds: 6),
   }) async {
     try {
-      return await request(primaryBaseUrl);
+      return await request(primaryBaseUrl).timeout(timeout);
+    } on TimeoutException {
+      return request(fallbackBaseUrl).timeout(timeout);
     } on SocketException {
-      return request(fallbackBaseUrl);
+      return request(fallbackBaseUrl).timeout(timeout);
     } on http.ClientException {
-      return request(fallbackBaseUrl);
+      return request(fallbackBaseUrl).timeout(timeout);
     } catch (e) {
       if (e.toString().contains('XMLHttpRequest') ||
           e.toString().contains('Failed host lookup') ||
           e.toString().contains('Connection refused') ||
           e.toString().contains('NetworkError')) {
-        return request(fallbackBaseUrl);
+        return request(fallbackBaseUrl).timeout(timeout);
       }
       rethrow;
     }
@@ -143,6 +164,7 @@ class AuthService {
       throw Exception(body['error'] ?? 'Session expired');
     }
 
+    await saveMe(body);
     return body;
   }
 

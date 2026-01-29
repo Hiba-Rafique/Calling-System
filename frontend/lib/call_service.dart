@@ -20,6 +20,8 @@ class CallService {
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
   MediaStream? _remoteStream;
+  bool _isVideoCall = false;
+  bool _isCameraOn = false;
   
   // User information
   String? _currentUserId;
@@ -45,11 +47,13 @@ class CallService {
   
   // Stream controllers for UI updates
   final _remoteStreamController = StreamController<MediaStream?>.broadcast();
+  final _localStreamController = StreamController<MediaStream?>.broadcast();
   
   // Getters for streams
   Stream<Map<String, dynamic>> get callStateStream => _callStateController.stream;
   Stream<Map<String, dynamic>> get incomingCallStream => _incomingCallController.stream;
   Stream<MediaStream?> get remoteStreamStream => _remoteStreamController.stream;
+  Stream<MediaStream?> get localStreamStream => _localStreamController.stream;
   Stream<Duration> get callDurationStream => _callDurationController.stream;
   
   // Getters for current state
@@ -65,6 +69,31 @@ class CallService {
   Duration get callDuration => _callDuration;
   bool get isMuted => _isMuted;
   bool get isSpeakerOn => _isSpeakerOn;
+  bool get isVideoCall => _isVideoCall;
+  bool get isCameraOn => _isCameraOn;
+
+  Future<void> setCameraOn(bool enabled) async {
+    _isCameraOn = enabled;
+    final videoTracks = _localStream?.getVideoTracks() ?? [];
+    if (videoTracks.isNotEmpty) {
+      videoTracks.first.enabled = enabled;
+    }
+    _updateCallState(_callState);
+  }
+
+  Future<void> toggleCamera() async {
+    await setCameraOn(!_isCameraOn);
+  }
+
+  Future<void> switchCamera() async {
+    final videoTracks = _localStream?.getVideoTracks() ?? [];
+    if (videoTracks.isEmpty) return;
+    try {
+      await Helper.switchCamera(videoTracks.first);
+    } catch (e) {
+      debugPrint('Switch camera failed: $e');
+    }
+  }
 
   Future<void> setMuted(bool muted) async {
     _isMuted = muted;
@@ -116,7 +145,7 @@ class CallService {
     _setupSocketListeners();
     
     // Initialize WebRTC
-    await _initializeWebRTC();
+    await _initializeWebRTC(enableVideo: false);
   }
 
   /// Set up Socket.IO event listeners for signaling
@@ -189,8 +218,20 @@ class CallService {
   }
 
   /// Initialize WebRTC peer connection and local media stream
-  Future<void> _initializeWebRTC() async {
+  Future<void> _initializeWebRTC({required bool enableVideo}) async {
     try {
+      _remoteStream = null;
+      _remoteStreamController.add(null);
+
+      await _peerConnection?.close();
+      await _peerConnection?.dispose();
+      _peerConnection = null;
+
+      _localStream?.getTracks().forEach((track) => track.stop());
+      await _localStream?.dispose();
+      _localStream = null;
+      _localStreamController.add(null);
+
       // Create peer connection with STUN servers
       _peerConnection = await createPeerConnection({
         'iceServers': [
@@ -246,6 +287,13 @@ class CallService {
         if (!micStatus.isGranted) {
           throw Exception('Microphone permission denied');
         }
+
+        if (enableVideo) {
+          final camStatus = await Permission.camera.request();
+          if (!camStatus.isGranted) {
+            throw Exception('Camera permission denied');
+          }
+        }
       }
 
       // Get local audio stream
@@ -255,8 +303,20 @@ class CallService {
           'noiseSuppression': true,
           'autoGainControl': true,
         },
-        'video': false,
+        'video': enableVideo
+            ? {
+                'facingMode': 'user',
+              }
+            : false,
       });
+
+      _isCameraOn = enableVideo;
+      final videoTracks = _localStream?.getVideoTracks() ?? [];
+      if (videoTracks.isNotEmpty) {
+        videoTracks.first.enabled = _isCameraOn;
+      }
+
+      _localStreamController.add(_localStream);
       
       // Add local tracks to peer connection
       for (final track in _localStream!.getTracks()) {
@@ -276,8 +336,16 @@ class CallService {
     }
   }
 
+  bool _offerContainsVideo(Map<String, dynamic> offerData) {
+    final sdp = offerData['sdp'];
+    if (sdp is String) {
+      return sdp.contains('\nm=video') || sdp.contains('\rm=video');
+    }
+    return false;
+  }
+
   /// Initiate a call to another user
-  Future<void> callUser(String targetUserId) async {
+  Future<void> callUser(String targetUserId, {bool video = false}) async {
     if (_callState != CallState.idle && _callState != CallState.ringing) {
       throw Exception('Already in a call');
     }
@@ -287,6 +355,9 @@ class CallService {
     }
     
     try {
+      _isVideoCall = video;
+      await _initializeWebRTC(enableVideo: video);
+
       _remoteUserId = targetUserId;
       _callId = '${_currentUserId}_$targetUserId';
       
@@ -306,7 +377,7 @@ class CallService {
       // Create offer
       RTCSessionDescription offer = await _peerConnection!.createOffer({
         'offerToReceiveAudio': 1,
-        'offerToReceiveVideo': 0,
+        'offerToReceiveVideo': video ? 1 : 0,
       });
       
       // Set local description
@@ -334,6 +405,10 @@ class CallService {
     }
     
     try {
+      final hasVideo = _offerContainsVideo(offerData);
+      _isVideoCall = hasVideo;
+      await _initializeWebRTC(enableVideo: hasVideo);
+
       _remoteUserId = from;
       _callId = callId;
       
@@ -359,7 +434,7 @@ class CallService {
       // Now create answer
       RTCSessionDescription answer = await _peerConnection!.createAnswer({
         'offerToReceiveAudio': 1,
-        'offerToReceiveVideo': 0,
+        'offerToReceiveVideo': hasVideo ? 1 : 0,
       });
       
       // Set local description
@@ -400,6 +475,8 @@ class CallService {
     _updateCallState(CallState.idle);
     _remoteUserId = null;
     _callId = null;
+    _isVideoCall = false;
+    _isCameraOn = false;
     
     debugPrint('Call rejected from: $from');
   }
@@ -606,6 +683,8 @@ class CallService {
       'remoteUserId': _remoteUserId,
       'isMuted': _isMuted,
       'isSpeakerOn': _isSpeakerOn,
+      'isVideoCall': _isVideoCall,
+      'isCameraOn': _isCameraOn,
       'callDurationMs': _callDuration.inMilliseconds,
     });
   }
@@ -627,6 +706,7 @@ class CallService {
     _callStateController.close();
     _incomingCallController.close();
     _remoteStreamController.close();
+    _localStreamController.close();
     _callDurationController.close();
     
     SoundManager().dispose();

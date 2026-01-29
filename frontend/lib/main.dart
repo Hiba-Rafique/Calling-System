@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 import 'auth_screen.dart';
 import 'auth_service.dart';
 import 'call_screen.dart';
@@ -9,6 +10,9 @@ import 'set_call_id_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  await Hive.initFlutter();
+  await Hive.openBox<dynamic>('auth');
 
   if (!kIsWeb) {
     await BackgroundCallService().initialize();
@@ -71,8 +75,17 @@ class _AppNavigatorState extends State<AppNavigator> {
 
       final me = await _authService.me(baseUrl: _primaryBaseUrl, token: token);
       await _handleLoggedIn(me);
-    } catch (_) {
-      await _authService.clearToken();
+    } catch (e) {
+      final cachedMe = await _authService.getCachedMe();
+      if (cachedMe != null) {
+        await _handleLoggedIn(cachedMe);
+        return;
+      }
+
+      final msg = e.toString();
+      if (msg.contains('Session expired') || msg.contains('status 401')) {
+        await _authService.clearToken();
+      }
     } finally {
       if (mounted) {
         setState(() {

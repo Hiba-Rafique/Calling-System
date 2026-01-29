@@ -46,6 +46,18 @@ class _CallingInterfaceState extends State<CallingInterface>
         setState(() {});
       }
     });
+
+    _callService.callStateStream.listen((_) {
+      if (mounted) {
+        setState(() {});
+      }
+    });
+  }
+
+  String _formatDuration(Duration d) {
+    final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
   }
 
   void _setupAnimations() {
@@ -277,12 +289,19 @@ class _CallingInterfaceState extends State<CallingInterface>
                   if (_callService.callState == CallState.connected)
                     Padding(
                       padding: EdgeInsets.symmetric(vertical: 16),
-                      child: Text(
-                        '00:00', // TODO: Implement call timer
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 18,
-                        ),
+                      child: StreamBuilder<Duration>(
+                        stream: _callService.callDurationStream,
+                        initialData: _callService.callDuration,
+                        builder: (context, snapshot) {
+                          final duration = snapshot.data ?? Duration.zero;
+                          return Text(
+                            _formatDuration(duration),
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 18,
+                            ),
+                          );
+                        },
                       ),
                     ),
                   
@@ -295,10 +314,13 @@ class _CallingInterfaceState extends State<CallingInterface>
                         // Speaker button (only when connected)
                         if (_callService.callState == CallState.connected)
                           _buildControlButton(
-                            icon: Icons.volume_up,
-                            onPressed: () {
-                              // TODO: Toggle speaker
-                              SoundManager().vibrateOnce();
+                            icon: _callService.isSpeakerOn ? Icons.volume_up : Icons.volume_off,
+                            onPressed: () async {
+                              await SoundManager().vibrateOnce();
+                              await _callService.toggleSpeaker();
+                              if (mounted) {
+                                setState(() {});
+                              }
                             },
                             backgroundColor: Colors.grey[800]!,
                           ),
@@ -306,10 +328,13 @@ class _CallingInterfaceState extends State<CallingInterface>
                         // Mute button (only when connected)
                         if (_callService.callState == CallState.connected)
                           _buildControlButton(
-                            icon: Icons.mic,
-                            onPressed: () {
-                              // TODO: Toggle mute
-                              SoundManager().vibrateOnce();
+                            icon: _callService.isMuted ? Icons.mic_off : Icons.mic,
+                            onPressed: () async {
+                              await SoundManager().vibrateOnce();
+                              await _callService.toggleMuted();
+                              if (mounted) {
+                                setState(() {});
+                              }
                             },
                             backgroundColor: Colors.grey[800]!,
                           ),

@@ -31,6 +31,14 @@ class CallService {
   CallState _callState = CallState.idle;
   final StreamController<Map<String, dynamic>> _callStateController = StreamController.broadcast();
   final StreamController<Map<String, dynamic>> _incomingCallController = StreamController.broadcast();
+
+  DateTime? _callConnectedAt;
+  Duration _callDuration = Duration.zero;
+  Timer? _callDurationTimer;
+  final StreamController<Duration> _callDurationController = StreamController.broadcast();
+
+  bool _isMuted = false;
+  bool _isSpeakerOn = false;
   
   // ICE candidate buffering
   final List<Map<String, dynamic>> _bufferedIceCandidates = [];
@@ -42,6 +50,7 @@ class CallService {
   Stream<Map<String, dynamic>> get callStateStream => _callStateController.stream;
   Stream<Map<String, dynamic>> get incomingCallStream => _incomingCallController.stream;
   Stream<MediaStream?> get remoteStreamStream => _remoteStreamController.stream;
+  Stream<Duration> get callDurationStream => _callDurationController.stream;
   
   // Getters for current state
   CallState get callState => _callState;
@@ -53,6 +62,45 @@ class CallService {
   String? get remoteUserId => _remoteUserId;
   MediaStream? get localStream => _localStream;
   MediaStream? get remoteStream => _remoteStream;
+  Duration get callDuration => _callDuration;
+  bool get isMuted => _isMuted;
+  bool get isSpeakerOn => _isSpeakerOn;
+
+  Future<void> setMuted(bool muted) async {
+    _isMuted = muted;
+    final audioTracks = _localStream?.getAudioTracks() ?? [];
+    if (audioTracks.isNotEmpty) {
+      audioTracks.first.enabled = !muted;
+      if (!kIsWeb) {
+        try {
+          await Helper.setMicrophoneMute(muted, audioTracks.first);
+        } catch (e) {
+          debugPrint('Microphone mute failed: $e');
+        }
+      }
+    }
+    _updateCallState(_callState);
+  }
+
+  Future<void> toggleMuted() async {
+    await setMuted(!_isMuted);
+  }
+
+  Future<void> setSpeakerOn(bool enabled) async {
+    _isSpeakerOn = enabled;
+    if (!kIsWeb) {
+      try {
+        await Helper.setSpeakerphoneOn(enabled);
+      } catch (e) {
+        debugPrint('Speaker toggle failed: $e');
+      }
+    }
+    _updateCallState(_callState);
+  }
+
+  Future<void> toggleSpeaker() async {
+    await setSpeakerOn(!_isSpeakerOn);
+  }
 
   /// Initialize the service with user ID and connect to signaling server
   Future<void> initialize(String userId, {String serverUrl = kSignalingServerUrl}) async {
@@ -109,7 +157,16 @@ class CallService {
     
     // Handle call ended
     _socket!.on('callEnded', (data) {
-      debugPrint('Call ended by: ${data['from']}');
+      final from = data['from']?.toString();
+      debugPrint('Call ended by: $from');
+      if (_callState == CallState.idle) {
+        debugPrint('Already idle; ignoring callEnded');
+        return;
+      }
+      if (from != null && from != _remoteUserId) {
+        debugPrint('callEnded from unexpected user ($from); ignoring');
+        return;
+      }
       _endCall();
     });
     
@@ -488,8 +545,12 @@ class CallService {
 
   /// End the current call
   void endCall() {
-    // Note: Backend doesn't have explicit end call handling
-    // Just end the call locally
+    if (_remoteUserId != null && _socket != null) {
+      _socket!.emit('endCall', {
+        'to': _remoteUserId,
+        'from': _currentUserId,
+      });
+    }
     _endCall();
   }
 
@@ -498,6 +559,10 @@ class CallService {
     // Cancel any timers
     _dialingTimer?.cancel();
     _dialingTimer = null;
+    _callDurationTimer?.cancel();
+    _callDurationTimer = null;
+    _callDuration = Duration.zero;
+    _callConnectedAt = null;
     
     // Stop all sounds
     SoundManager().stopAll();
@@ -516,10 +581,32 @@ class CallService {
   
   /// Update call state and notify listeners
   void _updateCallState(CallState newState) {
+    final previousState = _callState;
     _callState = newState;
+
+    if (previousState != CallState.connected && newState == CallState.connected) {
+      _callConnectedAt = DateTime.now();
+      _callDuration = Duration.zero;
+      _callDurationController.add(_callDuration);
+      _callDurationTimer?.cancel();
+      _callDurationTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (_callConnectedAt == null) return;
+        _callDuration = DateTime.now().difference(_callConnectedAt!);
+        _callDurationController.add(_callDuration);
+      });
+    }
+
+    if (previousState == CallState.connected && newState != CallState.connected) {
+      _callDurationTimer?.cancel();
+      _callDurationTimer = null;
+    }
+
     _callStateController.add({
       'callState': _callState,
       'remoteUserId': _remoteUserId,
+      'isMuted': _isMuted,
+      'isSpeakerOn': _isSpeakerOn,
+      'callDurationMs': _callDuration.inMilliseconds,
     });
   }
 
@@ -540,6 +627,7 @@ class CallService {
     _callStateController.close();
     _incomingCallController.close();
     _remoteStreamController.close();
+    _callDurationController.close();
     
     SoundManager().dispose();
     

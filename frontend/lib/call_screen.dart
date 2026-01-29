@@ -3,7 +3,6 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'call_service.dart';
 import 'calling_interface.dart';
 import 'sound_manager.dart';
-import 'background_call_service.dart';
 
 /// Main calling screen with UI for making and receiving calls
 class CallScreen extends StatefulWidget {
@@ -32,67 +31,44 @@ class _CallScreenState extends State<CallScreen> {
   @override
   void initState() {
     super.initState();
-    _initializeCallService();
+    _setupListeners();
   }
 
   @override
   void dispose() {
     _targetUserIdController.dispose();
-    _callService.dispose();
     super.dispose();
   }
 
-  /// Initialize the CallService and set up listeners
-  Future<void> _initializeCallService() async {
-    try {
-      // Connect background service to server
-      BackgroundCallService().connectToServer(
-        widget.userId,
-        serverUrl: kSignalingServerUrl,
-      );
-      
-      // Set up stream listeners
-      _callService.callStateStream.listen((state) {
-        setState(() {
-          // Show calling interface when in any active call state
-          _showCallingInterface = state['callState'] != CallState.idle;
-        });
-        
-        // Update background service notifications
-        if (state['callState'] == CallState.connected) {
-          BackgroundCallService().showCallConnectedNotification(
-            _callService.remoteUserId ?? 'Unknown'
-          );
-        } else if (state['callState'] == CallState.idle) {
-          BackgroundCallService().clearNotifications();
-        }
-      });
-
-      _callService.incomingCallStream.listen((callData) {
-        setState(() {
-          _currentCallTarget = callData['from'];
-          _incomingCallOffer = callData['offer'];
-          _incomingCallId = callData['callId'];
-        });
-        
-        _showIncomingCallDialog();
-      });
-
-      _callService.remoteStreamStream.listen((stream) {
-        setState(() {
-          _remoteStream = stream;
-        });
-      });
-
-      // Initialize the service
-      await _callService.initialize(widget.userId);
-      
+  void _setupListeners() {
+    _callService.callStateStream.listen((state) {
+      if (!mounted) return;
       setState(() {
-        _isInitialized = true;
+        _showCallingInterface = state['callState'] != CallState.idle;
       });
-    } catch (e) {
-      _showErrorDialog('Failed to initialize call service: ${e.toString()}');
-    }
+    });
+
+    _callService.incomingCallStream.listen((callData) {
+      if (!mounted) return;
+      setState(() {
+        _currentCallTarget = callData['from'];
+        _incomingCallOffer = callData['offer'];
+        _incomingCallId = callData['callId'];
+      });
+
+      _showIncomingCallDialog();
+    });
+
+    _callService.remoteStreamStream.listen((stream) {
+      if (!mounted) return;
+      setState(() {
+        _remoteStream = stream;
+      });
+    });
+
+    setState(() {
+      _isInitialized = true;
+    });
   }
 
   /// Show incoming call dialog

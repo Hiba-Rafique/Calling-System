@@ -4,8 +4,12 @@ A real-time voice calling application built with Flutter (frontend) and Node.js 
 
 ## Features
 
-- Real-time voice calls between any two users
+- Email/password registration + login (JWT)
+- Persistent login (Hive)
+- Set a unique public **Call ID** (`call_user_id`) used for calling
+- Real-time voice calls and video calls between any two users
 - WebRTC technology for peer-to-peer audio
+- WebRTC peer-to-peer video (optional per call)
 - Socket.IO signaling for call setup
 - Professional calling interface with visual feedback
 - Call states: Dialing, Ringing, Connecting, Connected
@@ -13,6 +17,7 @@ A real-time voice calling application built with Flutter (frontend) and Node.js 
 - Vibration feedback on mobile devices
 - Responsive UI for all screen sizes
 - Cross-platform: Web, Android, iOS support
+- Server URL strategy: **zrok first**, automatic **localhost fallback** when no response
 
 ## Architecture
 
@@ -62,9 +67,10 @@ flutter run
 ```
 
 ### 4. Test the Application
-1. Open the app in two browser windows/devices
-2. Register with different user IDs (e.g., "user1", "user2")
-3. Make calls between users!
+1. Open the app in two devices/simulators
+2. Create accounts (email/password)
+3. Set a unique **Call ID** when prompted
+4. Use **Voice Call** or **Video Call** to call another user by Call ID
 
 ## Platform-Specific Setup
 
@@ -100,12 +106,27 @@ The backend runs on port 5000 by default. To change:
 server.listen(5000, () => console.log('Server running on port 5000'));
 ```
 
+### Auth Endpoints
+- `POST /api/auth/register`
+- `POST /api/auth/login`
+- `GET /api/me` (JWT required)
+- `POST /api/me/call-user-id` (JWT required)
+
+### Database
+The `users` table includes:
+- `email` (unique)
+- `password_hash`
+- `call_user_id` (nullable, unique)
+
 ### Frontend Configuration
-The frontend connects to `localhost:5000` by default. To change:
-```dart
-// frontend/lib/call_service.dart
-await _callService.initialize(userId, serverUrl: 'http://localhost:5000');
-```
+The app prefers the hosted **zrok** URL first, and automatically falls back to:
+- `http://localhost:5000`
+
+The same zrok-first strategy is used for:
+- REST API requests (register/login/me/call-user-id)
+- Socket.IO signaling
+
+Login sessions are persisted using Hive (`frontend/lib/auth_service.dart`).
 
 ## Audio Files (Optional)
 
@@ -138,6 +159,16 @@ npm start
 - Ensure microphone is not muted
 - Try different browsers (Chrome recommended)
 - Check device microphone settings
+
+#### 4. "Camera permission denied" (Video Calls)
+- Android: ensure these permissions exist in manifests:
+  - `android.permission.CAMERA`
+  - `android.permission.RECORD_AUDIO`
+- iOS: ensure `Info.plist` contains:
+  - `NSCameraUsageDescription`
+  - `NSMicrophoneUsageDescription`
+- After changing permissions, do a **full rebuild** (hot reload is not enough)
+- If you previously tapped **Don't ask again** on Android, enable permissions manually in App Settings
 
 #### 4. "Build failed on Android"
 ```bash

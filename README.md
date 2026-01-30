@@ -36,6 +36,21 @@ Flutter + Node.js (Socket.IO) calling app using WebRTC (P2P).
 
 ## Quick start
 
+## Database (run schema.sql first)
+
+Before starting the backend, create the MySQL schema:
+
+```bash
+# from repo root
+mysql -u <user> -p <database_name> < backend/schema.sql
+```
+
+Or inside MySQL:
+
+```sql
+SOURCE backend/schema.sql;
+```
+
 ### Backend
 
 ```bash
@@ -89,7 +104,3 @@ If missing, the app falls back to generated tones.
 - **iOS screen sharing**
   - Requires ReplayKit Broadcast Extension (native iOS target).
 
-## Status
-
-- README updated: **done**
-- Fallback logic improvements: **done**

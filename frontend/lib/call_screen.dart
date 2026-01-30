@@ -422,7 +422,12 @@ class _CallScreenState extends State<CallScreen> {
     Future<http.Response> Function(String baseUrl) request,
   ) async {
     try {
-      return await request(widget.primaryBaseUrl).timeout(const Duration(seconds: 6));
+      final res =
+          await request(widget.primaryBaseUrl).timeout(const Duration(seconds: 6));
+      if (res.statusCode >= 500) {
+        return request(widget.fallbackBaseUrl).timeout(const Duration(seconds: 6));
+      }
+      return res;
     } catch (_) {
       return request(widget.fallbackBaseUrl).timeout(const Duration(seconds: 6));
     }

@@ -68,7 +68,11 @@ class AuthService {
     Duration timeout = const Duration(seconds: 6),
   }) async {
     try {
-      return await request(primaryBaseUrl).timeout(timeout);
+      final res = await request(primaryBaseUrl).timeout(timeout);
+      if (res.statusCode >= 500) {
+        return request(fallbackBaseUrl).timeout(timeout);
+      }
+      return res;
     } on TimeoutException {
       return request(fallbackBaseUrl).timeout(timeout);
     } on SocketException {

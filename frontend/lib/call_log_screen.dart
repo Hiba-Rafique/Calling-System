@@ -45,9 +45,15 @@ class _CallLogScreenState extends State<CallLogScreen> {
     Duration timeout = const Duration(seconds: 6),
   }) async {
     try {
-      return await http
+      final res = await http
           .get(_uri(widget.primaryBaseUrl, path), headers: headers)
           .timeout(timeout);
+      if (res.statusCode >= 500) {
+        return http
+            .get(_uri(widget.fallbackBaseUrl, path), headers: headers)
+            .timeout(timeout);
+      }
+      return res;
     } on TimeoutException {
       return http
           .get(_uri(widget.fallbackBaseUrl, path), headers: headers)

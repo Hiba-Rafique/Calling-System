@@ -31,3 +31,13 @@ CREATE TABLE IF NOT EXISTS calls (
   INDEX idx_calls_caller (caller_id),
   INDEX idx_calls_receiver (receiver_id)
 );
+
+CREATE TABLE call_participants (
+    call_id INT NOT NULL,
+    user_id INT NOT NULL,
+    joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(call_id, user_id),
+    FOREIGN KEY(call_id) REFERENCES calls(call_id),
+    FOREIGN KEY(user_id) REFERENCES users(user_id)
+);
+

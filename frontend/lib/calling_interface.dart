@@ -157,6 +157,12 @@ class _CallingInterfaceState extends State<CallingInterface>
 
   @override
   Widget build(BuildContext context) {
+    final screenSize = MediaQuery.of(context).size;
+    final localPreviewWidth = (screenSize.width * 0.30).clamp(96.0, 160.0);
+    final localPreviewHeight = (screenSize.height * 0.25).clamp(128.0, 220.0);
+    final isInVideoConnected =
+        _callService.isVideoCall && _callService.callState == CallState.connected;
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: FadeTransition(
@@ -168,7 +174,7 @@ class _CallingInterfaceState extends State<CallingInterface>
                 child: RTCVideoView(
                   _remoteRenderer,
                   mirror: false,
-                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
                 ),
               ),
 
@@ -176,8 +182,8 @@ class _CallingInterfaceState extends State<CallingInterface>
               Positioned(
                 right: 16,
                 top: 80,
-                width: 120,
-                height: 160,
+                width: localPreviewWidth,
+                height: localPreviewHeight,
                 child: Container(
                   decoration: BoxDecoration(
                     color: Colors.black,
@@ -188,7 +194,7 @@ class _CallingInterfaceState extends State<CallingInterface>
                   child: RTCVideoView(
                     _localRenderer,
                     mirror: true,
-                    objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                    objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
                   ),
                 ),
               ),
@@ -212,132 +218,227 @@ class _CallingInterfaceState extends State<CallingInterface>
             SafeArea(
               child: Column(
                 children: [
-                  // Top status bar
-                  Padding(
-                    padding: EdgeInsets.all(16.0),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  if (!isInVideoConnected) ...[
+                    // Top status bar
+                    Padding(
+                      padding: EdgeInsets.all(16.0),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            'Calling System',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 18,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                          Row(
+                            children: [
+                              Icon(
+                                Icons.signal_cellular_4_bar,
+                                color: Colors.white,
+                                size: 20,
+                              ),
+                              SizedBox(width: 4),
+                              Icon(
+                                Icons.battery_full,
+                                color: Colors.white,
+                                size: 20,
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    
+                    Spacer(),
+                    
+                    // User avatar and name
+                    Column(
                       children: [
+                        AnimatedBuilder(
+                          animation: _pulseAnimation,
+                          builder: (context, child) {
+                            return Transform.scale(
+                              scale: _callService.callState == CallState.ringing ||
+                                      _callService.callState == CallState.dialing
+                                  ? _pulseAnimation.value
+                                  : 1.0,
+                              child: Container(
+                                width: 120,
+                                height: 120,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: Colors.grey[800],
+                                  border: Border.all(
+                                    color: _getStatusColor(),
+                                    width: 3,
+                                  ),
+                                ),
+                                child: Icon(
+                                  Icons.person,
+                                  size: 60,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                        SizedBox(height: 24),
+                        
                         Text(
-                          'Calling System',
+                          widget.targetUserId,
                           style: TextStyle(
                             color: Colors.white,
-                            fontSize: 18,
-                            fontWeight: FontWeight.w500,
+                            fontSize: 28,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
+                        SizedBox(height: 8),
+                        
                         Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
                           children: [
                             Icon(
-                              Icons.signal_cellular_4_bar,
-                              color: Colors.white,
+                              _getStatusIcon(),
+                              color: _getStatusColor(),
                               size: 20,
                             ),
-                            SizedBox(width: 4),
-                            Icon(
-                              Icons.battery_full,
-                              color: Colors.white,
-                              size: 20,
+                            SizedBox(width: 8),
+                            Text(
+                              _getCallStatusText(),
+                              style: TextStyle(
+                                color: _getStatusColor(),
+                                fontSize: 16,
+                              ),
                             ),
                           ],
                         ),
                       ],
                     ),
-                  ),
-                  
-                  Spacer(),
-                  
-                  // User avatar and name
-                  Column(
-                    children: [
-                      AnimatedBuilder(
-                        animation: _pulseAnimation,
-                        builder: (context, child) {
-                          return Transform.scale(
-                            scale: _callService.callState == CallState.ringing ||
-                                   _callService.callState == CallState.dialing
-                                ? _pulseAnimation.value
-                                : 1.0,
-                            child: Container(
-                              width: 120,
-                              height: 120,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: Colors.grey[800],
-                                border: Border.all(
-                                  color: _getStatusColor(),
-                                  width: 3,
-                                ),
-                              ),
-                              child: Icon(
-                                Icons.person,
-                                size: 60,
+                    
+                    Spacer(),
+                    
+                    // Call duration (only show when connected)
+                    if (_callService.callState == CallState.connected)
+                      Padding(
+                        padding: EdgeInsets.symmetric(vertical: 16),
+                        child: StreamBuilder<Duration>(
+                          stream: _callService.callDurationStream,
+                          initialData: _callService.callDuration,
+                          builder: (context, snapshot) {
+                            final duration = snapshot.data ?? Duration.zero;
+                            return Text(
+                              _formatDuration(duration),
+                              style: TextStyle(
                                 color: Colors.white,
+                                fontSize: 18,
                               ),
-                            ),
-                          );
-                        },
-                      ),
-                      SizedBox(height: 24),
-                      
-                      Text(
-                        widget.targetUserId,
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
+                            );
+                          },
                         ),
                       ),
-                      SizedBox(height: 8),
-                      
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
+                  ] else ...[
+                    Padding(
+                      padding: const EdgeInsets.only(top: 12, left: 12, right: 12),
+                      child: Row(
                         children: [
-                          Icon(
-                            _getStatusIcon(),
-                            color: _getStatusColor(),
-                            size: 20,
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withOpacity(0.35),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(color: Colors.white24),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  _callService.isScreenSharing
+                                      ? Icons.screen_share
+                                      : Icons.videocam,
+                                  color: Colors.white,
+                                  size: 16,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  _callService.isScreenSharing
+                                      ? 'Screen'
+                                      : 'Video',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
-                          SizedBox(width: 8),
-                          Text(
-                            _getCallStatusText(),
-                            style: TextStyle(
-                              color: _getStatusColor(),
-                              fontSize: 16,
+                          const SizedBox(width: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withOpacity(0.35),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(color: Colors.white24),
+                            ),
+                            child: StreamBuilder<Duration>(
+                              stream: _callService.callDurationStream,
+                              initialData: _callService.callDuration,
+                              builder: (context, snapshot) {
+                                final duration = snapshot.data ?? Duration.zero;
+                                return Text(
+                                  _formatDuration(duration),
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                          const Spacer(),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withOpacity(0.35),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(color: Colors.white24),
+                            ),
+                            child: Text(
+                              widget.targetUserId,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                              ),
                             ),
                           ),
                         ],
                       ),
-                    ],
-                  ),
-                  
-                  Spacer(),
-                  
-                  // Call duration (only show when connected)
-                  if (_callService.callState == CallState.connected)
-                    Padding(
-                      padding: EdgeInsets.symmetric(vertical: 16),
-                      child: StreamBuilder<Duration>(
-                        stream: _callService.callDurationStream,
-                        initialData: _callService.callDuration,
-                        builder: (context, snapshot) {
-                          final duration = snapshot.data ?? Duration.zero;
-                          return Text(
-                            _formatDuration(duration),
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 18,
-                            ),
-                          );
-                        },
-                      ),
                     ),
+                    const Spacer(),
+                  ],
                   
                   // Call controls
-                  Padding(
-                    padding: EdgeInsets.all(32.0),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  Container(
+                    padding: EdgeInsets.only(
+                      left: 16,
+                      right: 16,
+                      top: 16,
+                      bottom: 24,
+                    ),
+                    decoration: BoxDecoration(
+                      color: (_callService.isVideoCall)
+                          ? Colors.black.withOpacity(0.35)
+                          : Colors.transparent,
+                    ),
+                    child: Wrap(
+                      alignment: WrapAlignment.center,
+                      spacing: 16,
+                      runSpacing: 16,
                       children: [
                         if (_callService.callState == CallState.connected &&
                             _callService.isVideoCall)
@@ -348,6 +449,34 @@ class _CallingInterfaceState extends State<CallingInterface>
                             onPressed: () async {
                               await SoundManager().vibrateOnce();
                               await _callService.toggleCamera();
+                              if (mounted) {
+                                setState(() {});
+                              }
+                            },
+                            backgroundColor: Colors.grey[800]!,
+                          ),
+
+                        if (_callService.callState == CallState.connected &&
+                            _callService.isVideoCall)
+                          _buildControlButton(
+                            icon: _callService.isScreenSharing
+                                ? Icons.stop_screen_share
+                                : Icons.screen_share,
+                            onPressed: () async {
+                              await SoundManager().vibrateOnce();
+                              try {
+                                if (_callService.isScreenSharing) {
+                                  await _callService.stopScreenShare();
+                                } else {
+                                  await _callService.startScreenShare();
+                                }
+                              } catch (e) {
+                                if (mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(content: Text(e.toString())),
+                                  );
+                                }
+                              }
                               if (mounted) {
                                 setState(() {});
                               }

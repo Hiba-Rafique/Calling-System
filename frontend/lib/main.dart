@@ -242,6 +242,8 @@ class _AppNavigatorState extends State<AppNavigator> {
     // Show call screen if user is registered
     return CallScreen(
       userId: _callUserId ?? _registeredUserId!,
+      primaryBaseUrl: _primaryBaseUrl,
+      fallbackBaseUrl: _fallbackBaseUrl,
     );
   }
 }

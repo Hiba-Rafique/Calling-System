@@ -18,6 +18,7 @@ A real-time voice calling application built with Flutter (frontend) and Node.js 
 - Responsive UI for all screen sizes
 - Cross-platform: Web, Android, iOS support
 - Server URL strategy: **zrok first**, automatic **localhost fallback** when no response
+- Screen sharing (Video Calls): Web/Desktop supported; Android supported with MediaProjection permissions; iOS requires ReplayKit Broadcast Extension
 
 ## Architecture
 
@@ -169,6 +170,14 @@ npm start
   - `NSMicrophoneUsageDescription`
 - After changing permissions, do a **full rebuild** (hot reload is not enough)
 - If you previously tapped **Don't ask again** on Android, enable permissions manually in App Settings
+
+#### 5. "Screen sharing doesn't work" (Mobile)
+- Web/Desktop: works via `getDisplayMedia()`.
+- Android: requires MediaProjection support. Ensure these permissions exist in your manifests:
+  - `android.permission.FOREGROUND_SERVICE`
+  - `android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION`
+  Then do a **full rebuild** (hot reload is not enough).
+- iOS: requires a **ReplayKit Broadcast Extension** (native iOS setup in Xcode). This cannot be enabled with Dart-only changes.
 
 #### 4. "Build failed on Android"
 ```bash

@@ -1,9 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'sound_manager.dart';
+import 'web_unload.dart';
 
 const String kSignalingServerUrl = 'https://rjsw7olwsc3y.share.zrok.io';
 
@@ -20,14 +24,18 @@ class CallService {
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
   MediaStream? _remoteStream;
+  MediaStream? _screenStream;
   bool _isVideoCall = false;
   bool _isCameraOn = false;
+  bool _isScreenSharing = false;
   
   // User information
   String? _currentUserId;
   String? _remoteUserId;
   String? _callId;
   Timer? _dialingTimer;
+  Timer? _ringingTimer;
+  Timer? _connectingTimer;
   
   // Call state
   CallState _callState = CallState.idle;
@@ -71,6 +79,177 @@ class CallService {
   bool get isSpeakerOn => _isSpeakerOn;
   bool get isVideoCall => _isVideoCall;
   bool get isCameraOn => _isCameraOn;
+  bool get isScreenSharing => _isScreenSharing;
+
+  void _cancelCallTimers() {
+    _dialingTimer?.cancel();
+    _dialingTimer = null;
+    _ringingTimer?.cancel();
+    _ringingTimer = null;
+    _connectingTimer?.cancel();
+    _connectingTimer = null;
+  }
+
+  void _failCall(String reason, {bool notifyRemote = true}) {
+    if (_callState == CallState.idle) return;
+
+    final to = _remoteUserId;
+    final from = _currentUserId;
+    if (notifyRemote && to != null && from != null && _socket != null) {
+      try {
+        _socket!.emit('callFailed', {
+          'to': to,
+          'from': from,
+          'reason': reason,
+        });
+      } catch (_) {}
+    }
+
+    SoundManager().playCallEndedSound();
+    _endCall();
+  }
+
+  Future<void> _cleanupCallResources() async {
+    try {
+      _screenStream?.getTracks().forEach((t) => t.stop());
+      await _screenStream?.dispose();
+    } catch (_) {}
+    _screenStream = null;
+    _isScreenSharing = false;
+
+    try {
+      _localStream?.getTracks().forEach((t) => t.stop());
+      await _localStream?.dispose();
+    } catch (_) {}
+    _localStream = null;
+    _localStreamController.add(null);
+
+    try {
+      _remoteStream?.getTracks().forEach((t) => t.stop());
+      await _remoteStream?.dispose();
+    } catch (_) {}
+    _remoteStream = null;
+    _remoteStreamController.add(null);
+
+    try {
+      await _peerConnection?.close();
+      await _peerConnection?.dispose();
+    } catch (_) {}
+    _peerConnection = null;
+  }
+
+  Future<void> startScreenShare() async {
+    if (_peerConnection == null) {
+      throw Exception('WebRTC not initialized');
+    }
+    if (_callState != CallState.connected) {
+      throw Exception('Screen sharing is only available during an active call');
+    }
+    if (!_isVideoCall) {
+      throw Exception('Start a video call to share your screen');
+    }
+
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+      throw Exception(
+        'iOS screen sharing requires a ReplayKit Broadcast Extension (native iOS setup) and is not enabled yet',
+      );
+    }
+
+    const mediaProjectionChannel = MethodChannel('com.example.frontend/media_projection');
+
+    try {
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+        try {
+          await mediaProjectionChannel.invokeMethod('start');
+        } catch (_) {
+        }
+      }
+
+      final display = await navigator.mediaDevices.getDisplayMedia({
+        'video': true,
+        'audio': false,
+      });
+
+      final tracks = display.getVideoTracks();
+      if (tracks.isEmpty) {
+        throw Exception('No screen video track available');
+      }
+
+      _screenStream?.getTracks().forEach((t) => t.stop());
+      await _screenStream?.dispose();
+      _screenStream = display;
+
+      final screenTrack = tracks.first;
+      _isScreenSharing = true;
+      _isCameraOn = true;
+
+      try {
+        screenTrack.onEnded = () {
+          stopScreenShare();
+        };
+      } catch (_) {
+        // Some platforms may not support onEnded
+      }
+
+      final senders = await _peerConnection!.getSenders();
+      final videoSender = senders.where((s) => s.track?.kind == 'video').toList();
+      if (videoSender.isNotEmpty) {
+        await videoSender.first.replaceTrack(screenTrack);
+      } else {
+        await _peerConnection!.addTrack(screenTrack, _screenStream!);
+      }
+
+      _localStreamController.add(_screenStream);
+      _updateCallState(_callState);
+    } catch (e) {
+      debugPrint('Failed to start screen share: $e');
+
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+        try {
+          await mediaProjectionChannel.invokeMethod('stop');
+        } catch (_) {
+        }
+      }
+
+      rethrow;
+    }
+  }
+
+  Future<void> stopScreenShare() async {
+    if (!_isScreenSharing) return;
+    _isScreenSharing = false;
+
+    final cameraTrack = _localStream?.getVideoTracks().isNotEmpty == true
+        ? _localStream!.getVideoTracks().first
+        : null;
+
+    if (_peerConnection != null && cameraTrack != null) {
+      try {
+        final senders = await _peerConnection!.getSenders();
+        final videoSender = senders.where((s) => s.track?.kind == 'video').toList();
+        if (videoSender.isNotEmpty) {
+          await videoSender.first.replaceTrack(cameraTrack);
+        }
+      } catch (e) {
+        debugPrint('Failed to stop screen share (replaceTrack): $e');
+      }
+    }
+
+    _screenStream?.getTracks().forEach((t) => t.stop());
+    await _screenStream?.dispose();
+    _screenStream = null;
+
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      const mediaProjectionChannel = MethodChannel('com.example.frontend/media_projection');
+      try {
+        await mediaProjectionChannel.invokeMethod('stop');
+      } catch (_) {
+      }
+    }
+
+    _localStreamController.add(_localStream);
+    _updateCallState(_callState);
+  }
 
   Future<void> setCameraOn(bool enabled) async {
     _isCameraOn = enabled;
@@ -116,13 +295,19 @@ class CallService {
   }
 
   Future<void> setSpeakerOn(bool enabled) async {
-    _isSpeakerOn = enabled;
+    final previous = _isSpeakerOn;
     if (!kIsWeb) {
       try {
         await Helper.setSpeakerphoneOn(enabled);
+        await Future.delayed(const Duration(milliseconds: 250));
+        await Helper.setSpeakerphoneOn(enabled);
+        _isSpeakerOn = enabled;
       } catch (e) {
+        _isSpeakerOn = previous;
         debugPrint('Speaker toggle failed: $e');
       }
+    } else {
+      _isSpeakerOn = enabled;
     }
     _updateCallState(_callState);
   }
@@ -134,6 +319,14 @@ class CallService {
   /// Initialize the service with user ID and connect to signaling server
   Future<void> initialize(String userId, {String serverUrl = kSignalingServerUrl}) async {
     _currentUserId = userId;
+
+    if (kIsWeb) {
+      registerWebUnloadHandler(() {
+        if (_callState != CallState.idle) {
+          endCall();
+        }
+      });
+    }
     
     // Connect to Socket.IO server
     _socket = IO.io(serverUrl, <String, dynamic>{
@@ -170,6 +363,13 @@ class CallService {
         'offer': data['signal'], // Backend uses 'signal', not 'offer'
         'callId': _callId,
       });
+
+      _ringingTimer?.cancel();
+      _ringingTimer = Timer(const Duration(seconds: 30), () {
+        if (_callState == CallState.ringing) {
+          _failCall('no_answer');
+        }
+      });
     });
     
     // Handle call answers
@@ -205,6 +405,21 @@ class CallService {
       SoundManager().playCallEndedSound();
       _endCall();
     });
+
+    _socket!.on('callFailed', (data) {
+      final from = data is Map ? data['from']?.toString() : null;
+      final reason = data is Map ? data['reason']?.toString() : null;
+      debugPrint('Call failed from: $from reason=$reason');
+
+      if (_callState == CallState.idle) return;
+      if (from != null && from != _remoteUserId) {
+        debugPrint('callFailed from unexpected user ($from); ignoring');
+        return;
+      }
+
+      SoundManager().playCallEndedSound();
+      _endCall();
+    });
     
     // Handle connection events
     _socket!.on('connect', (_) {
@@ -214,6 +429,12 @@ class CallService {
     
     _socket!.on('disconnect', (_) {
       debugPrint('Disconnected from signaling server');
+
+      if (_callState == CallState.dialing ||
+          _callState == CallState.ringing ||
+          _callState == CallState.connecting) {
+        _failCall('signaling_disconnect', notifyRemote: false);
+      }
     });
   }
 
@@ -222,6 +443,11 @@ class CallService {
     try {
       _remoteStream = null;
       _remoteStreamController.add(null);
+
+      _screenStream?.getTracks().forEach((t) => t.stop());
+      await _screenStream?.dispose();
+      _screenStream = null;
+      _isScreenSharing = false;
 
       await _peerConnection?.close();
       await _peerConnection?.dispose();
@@ -254,6 +480,13 @@ class CallService {
           _updateCallState(CallState.connected);
           SoundManager().playCallConnectedSound();
         }
+
+        if (_callState != CallState.idle &&
+            (state == RTCIceConnectionState.RTCIceConnectionStateFailed ||
+                state == RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
+                state == RTCIceConnectionState.RTCIceConnectionStateClosed)) {
+          _failCall('ice_$state');
+        }
       };
 
       _peerConnection!.onConnectionState = (RTCPeerConnectionState state) {
@@ -262,6 +495,13 @@ class CallService {
             state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
           _updateCallState(CallState.connected);
           SoundManager().playCallConnectedSound();
+        }
+
+        if (_callState != CallState.idle &&
+            (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+                state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected ||
+                state == RTCPeerConnectionState.RTCPeerConnectionStateClosed)) {
+          _failCall('pc_$state');
         }
       };
       
@@ -349,11 +589,7 @@ class CallService {
     if (_callState != CallState.idle && _callState != CallState.ringing) {
       throw Exception('Already in a call');
     }
-    
-    if (_peerConnection == null) {
-      throw Exception('WebRTC not initialized');
-    }
-    
+
     try {
       _isVideoCall = video;
       await _initializeWebRTC(enableVideo: video);
@@ -368,9 +604,17 @@ class CallService {
       await SoundManager().playDialingSound();
       
       // Start dialing timer for timeout
-      _dialingTimer = Timer(Duration(seconds: 30), () {
-        if (_callState == CallState.dialing) {
-          _endCall();
+      _dialingTimer?.cancel();
+      _dialingTimer = Timer(const Duration(seconds: 30), () {
+        if (_callState == CallState.dialing || _callState == CallState.connecting) {
+          _failCall('timeout');
+        }
+      });
+
+      _connectingTimer?.cancel();
+      _connectingTimer = Timer(const Duration(seconds: 30), () {
+        if (_callState == CallState.connecting) {
+          _failCall('connect_timeout');
         }
       });
       
@@ -393,6 +637,8 @@ class CallService {
       debugPrint('Call initiated to: $targetUserId');
     } catch (e) {
       _updateCallState(CallState.idle);
+
+      await _cleanupCallResources();
       debugPrint('Failed to initiate call: $e');
       rethrow;
     }
@@ -409,11 +655,22 @@ class CallService {
       _isVideoCall = hasVideo;
       await _initializeWebRTC(enableVideo: hasVideo);
 
+      if (_peerConnection == null) {
+        throw Exception('WebRTC not initialized');
+      }
+
       _remoteUserId = from;
       _callId = callId;
       
       // Update state to connecting
       _updateCallState(CallState.connecting);
+
+      _connectingTimer?.cancel();
+      _connectingTimer = Timer(const Duration(seconds: 30), () {
+        if (_callState == CallState.connecting) {
+          _failCall('connect_timeout');
+        }
+      });
       
       // Stop ringing sound
       SoundManager().stopRingingSound();
@@ -452,7 +709,7 @@ class CallService {
           if (audioTracks.isNotEmpty) {
             await Helper.setMicrophoneMute(false, audioTracks.first);
           }
-          await Helper.setSpeakerphoneOn(true);
+          await setSpeakerOn(true);
         } catch (e) {
           debugPrint('Audio route setup failed: $e');
         }
@@ -461,6 +718,7 @@ class CallService {
       debugPrint('Call accepted from: $from');
     } catch (e) {
       _updateCallState(CallState.idle);
+      _failCall('accept_failed', notifyRemote: true);
       debugPrint('Failed to accept call: $e');
       rethrow;
     }
@@ -477,7 +735,22 @@ class CallService {
     _callId = null;
     _isVideoCall = false;
     _isCameraOn = false;
+    _isScreenSharing = false;
+
+    _screenStream?.getTracks().forEach((t) => t.stop());
+    _screenStream?.dispose();
+    _screenStream = null;
     
+    if (_socket != null && _currentUserId != null) {
+      try {
+        _socket!.emit('rejectCall', {
+          'to': from,
+          'from': _currentUserId,
+          'reason': 'rejected',
+        });
+      } catch (_) {}
+    }
+
     debugPrint('Call rejected from: $from');
   }
 
@@ -529,7 +802,7 @@ class CallService {
           if (audioTracks.isNotEmpty) {
             await Helper.setMicrophoneMute(false, audioTracks.first);
           }
-          await Helper.setSpeakerphoneOn(true);
+          await setSpeakerOn(true);
         } catch (e) {
           debugPrint('Audio route setup failed: $e');
         }
@@ -537,7 +810,7 @@ class CallService {
       
       debugPrint('Call answered successfully');
     } catch (e) {
-      _updateCallState(CallState.idle);
+      _failCall('answer_failed');
       debugPrint('Failed to handle answer: $e');
     }
   }
@@ -634,8 +907,7 @@ class CallService {
   /// Internal method to clean up call state
   void _endCall() {
     // Cancel any timers
-    _dialingTimer?.cancel();
-    _dialingTimer = null;
+    _cancelCallTimers();
     _callDurationTimer?.cancel();
     _callDurationTimer = null;
     _callDuration = Duration.zero;
@@ -648,10 +920,17 @@ class CallService {
     if (_callState == CallState.connected || _callState == CallState.dialing) {
       SoundManager().playCallEndedSound();
     }
+
+    // Tear down WebRTC to stop audio/video immediately
+    _cleanupCallResources();
     
     _updateCallState(CallState.idle);
     _remoteUserId = null;
     _callId = null;
+    _isVideoCall = false;
+    _isCameraOn = false;
+    _isSpeakerOn = false;
+    _isMuted = false;
     
     debugPrint('Call ended');
   }
@@ -662,6 +941,7 @@ class CallService {
     _callState = newState;
 
     if (previousState != CallState.connected && newState == CallState.connected) {
+      _cancelCallTimers();
       _callConnectedAt = DateTime.now();
       _callDuration = Duration.zero;
       _callDurationController.add(_callDuration);
@@ -685,6 +965,7 @@ class CallService {
       'isSpeakerOn': _isSpeakerOn,
       'isVideoCall': _isVideoCall,
       'isCameraOn': _isCameraOn,
+      'isScreenSharing': _isScreenSharing,
       'callDurationMs': _callDuration.inMilliseconds,
     });
   }

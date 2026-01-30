@@ -136,6 +136,39 @@ app.get('/api/me', authMiddleware, async (req, res) => {
   }
 });
 
+app.get('/api/users/search', authMiddleware, async (req, res) => {
+  try {
+    const q = (req.query.q ?? '').toString().trim();
+    if (!q) {
+      return res.json([]);
+    }
+
+    const pool = getPool();
+    const like = `${q}%`;
+    const [rows] = await pool.execute(
+      `SELECT user_id, first_name, last_name, call_user_id
+       FROM users
+       WHERE call_user_id IS NOT NULL
+         AND call_user_id LIKE ?
+       ORDER BY call_user_id ASC
+       LIMIT 10`,
+      [like]
+    );
+
+    const result = (rows || []).map((r) => ({
+      user_id: r.user_id,
+      first_name: r.first_name,
+      last_name: r.last_name,
+      call_user_id: r.call_user_id,
+    }));
+
+    return res.json(result);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.post('/api/me/call-user-id', authMiddleware, async (req, res) => {
   try {
     const { call_user_id } = req.body || {};
@@ -193,7 +226,8 @@ app.get('/api/contacts', authMiddleware, async (req, res) => {
         c.created_at,
         u.first_name,
         u.last_name,
-        u.email
+        u.email,
+        u.call_user_id
       FROM contacts c
       JOIN users u ON u.user_id = c.contact_user_id
       WHERE c.user_id = ?
@@ -209,16 +243,37 @@ app.get('/api/contacts', authMiddleware, async (req, res) => {
 
 app.post('/api/contacts', authMiddleware, async (req, res) => {
   try {
-    const { contact_user_id, nickname } = req.body || {};
-    if (!contact_user_id) {
-      return res.status(400).json({ error: 'contact_user_id is required' });
+    const { contact_user_id, contact_call_id, nickname } = req.body || {};
+    if (!contact_user_id && !contact_call_id) {
+      return res.status(400).json({ error: 'contact_user_id or contact_call_id is required' });
     }
 
     const pool = getPool();
 
+    let resolvedContactUserId = contact_user_id;
+    if (!resolvedContactUserId && contact_call_id) {
+      const callIdValue = String(contact_call_id).trim();
+      const [rows] = await pool.execute(
+        'SELECT user_id FROM users WHERE call_user_id = ? LIMIT 1',
+        [callIdValue]
+      );
+      if (!rows || rows.length === 0) {
+        return res.status(404).json({ error: 'Contact not found for that Call ID' });
+      }
+      resolvedContactUserId = rows[0].user_id;
+    }
+
+    if (!resolvedContactUserId) {
+      return res.status(400).json({ error: 'Invalid contact_user_id' });
+    }
+
+    if (Number(resolvedContactUserId) === Number(req.user.user_id)) {
+      return res.status(400).json({ error: 'Cannot add yourself as a contact' });
+    }
+
     const [userRows] = await pool.execute(
       'SELECT user_id FROM users WHERE user_id = ? LIMIT 1',
-      [contact_user_id]
+      [resolvedContactUserId]
     );
     if (!userRows || userRows.length === 0) {
       return res.status(404).json({ error: 'Contact user not found' });
@@ -227,7 +282,7 @@ app.post('/api/contacts', authMiddleware, async (req, res) => {
     try {
       const [result] = await pool.execute(
         'INSERT INTO contacts (user_id, contact_user_id, nickname) VALUES (?, ?, ?)',
-        [req.user.user_id, contact_user_id, nickname || null]
+        [req.user.user_id, resolvedContactUserId, nickname || null]
       );
       return res.status(201).json({ contact_id: result.insertId });
     } catch (err) {
@@ -351,6 +406,20 @@ io.on("connection", (socket) => {
   socket.on("answerCall", ({ to, signal }) => {
     if (onlineUsers[to]) {
       io.to(onlineUsers[to]).emit("callAccepted", signal);
+    }
+  });
+
+  // Reject call
+  socket.on("rejectCall", ({ to, from, reason }) => {
+    if (onlineUsers[to]) {
+      io.to(onlineUsers[to]).emit("callRejected", { from, reason: reason || 'rejected' });
+    }
+  });
+
+  // Call failed (timeout/ICE failure/etc)
+  socket.on("callFailed", ({ to, from, reason }) => {
+    if (onlineUsers[to]) {
+      io.to(onlineUsers[to]).emit("callFailed", { from, reason: reason || 'failed' });
     }
   });
 

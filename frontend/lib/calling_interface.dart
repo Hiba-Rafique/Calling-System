@@ -25,6 +25,12 @@ class _CallingInterfaceState extends State<CallingInterface>
   final CallService _callService = CallService();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  bool _isDisposed = false;
+  bool _isSpeakerOn = false;
+  bool _isMuted = false;
+  bool _isCameraOn = false;
+  bool _isScreenSharing = false;
+  Duration _callDuration = Duration.zero;
   late AnimationController _pulseController;
   late AnimationController _fadeController;
   late Animation<double> _pulseAnimation;
@@ -33,6 +39,13 @@ class _CallingInterfaceState extends State<CallingInterface>
   @override
   void initState() {
     super.initState();
+    
+    // Initialize state from CallService
+    _isSpeakerOn = _callService.isSpeakerOn;
+    _isMuted = _callService.isMuted;
+    _isCameraOn = _callService.isCameraOn;
+    _isScreenSharing = _callService.isScreenSharing;
+    
     _initializeRenderer();
     _setupAnimations();
   }
@@ -40,10 +53,14 @@ class _CallingInterfaceState extends State<CallingInterface>
   Future<void> _initializeRenderer() async {
     await _remoteRenderer.initialize();
     await _localRenderer.initialize();
-    _remoteRenderer.srcObject = _callService.remoteStream;
-    _localRenderer.srcObject = _callService.localStream;
+    
+    if (!_isDisposed) {
+      _remoteRenderer.srcObject = _callService.remoteStream;
+      _localRenderer.srcObject = _callService.localStream;
+    }
 
     _callService.remoteStreamStream.listen((stream) {
+      if (_isDisposed) return;
       _remoteRenderer.srcObject = stream;
       if (mounted) {
         setState(() {});
@@ -51,6 +68,7 @@ class _CallingInterfaceState extends State<CallingInterface>
     });
 
     _callService.localStreamStream.listen((stream) {
+      if (_isDisposed) return;
       _localRenderer.srcObject = stream;
       if (mounted) {
         setState(() {});
@@ -103,6 +121,7 @@ class _CallingInterfaceState extends State<CallingInterface>
 
   @override
   void dispose() {
+    _isDisposed = true;
     _pulseController.dispose();
     _fadeController.dispose();
     _remoteRenderer.dispose();
@@ -165,10 +184,8 @@ class _CallingInterfaceState extends State<CallingInterface>
 
     return Scaffold(
       backgroundColor: Colors.black,
-      body: FadeTransition(
-        opacity: _fadeAnimation,
-        child: Stack(
-          children: [
+      body: Stack(
+        children: [
             if (_callService.isVideoCall)
               Positioned.fill(
                 child: RTCVideoView(
@@ -548,7 +565,6 @@ class _CallingInterfaceState extends State<CallingInterface>
             ),
           ],
         ),
-      ),
     );
   }
 

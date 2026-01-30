@@ -43,10 +43,15 @@ class _SetCallIdScreenState extends State<SetCallIdScreen> {
         Navigator.of(context).pop(callId);
       }
     } catch (e) {
+      final msg = e.toString();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(e.toString()),
+            content: Text(
+              msg.contains('already taken')
+                  ? 'This Call ID is already taken. Please choose another one.'
+                  : msg,
+            ),
             backgroundColor: Colors.red,
           ),
         );

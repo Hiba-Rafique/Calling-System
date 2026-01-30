@@ -19,6 +19,76 @@ const io = new Server(server, {
 
 let onlineUsers = {};
 
+// Users who are currently in a call (ringing/connecting/connected)
+const busyUsers = new Set();
+// Bidirectional mapping of active peer (userId -> otherUserId)
+const activePeer = {};
+
+// Track DB call_id for active (ringing/connected) calls, keyed by pair
+const activeCallDbId = {};
+
+function pairKey(a, b) {
+  return `${a}::${b}`;
+}
+
+async function resolveUserIdByCallId(callUserId) {
+  if (!callUserId) return null;
+  try {
+    const pool = getPool();
+    const [rows] = await pool.execute(
+      'SELECT user_id FROM users WHERE call_user_id = ? LIMIT 1',
+      [String(callUserId).trim()]
+    );
+    if (!rows || rows.length === 0) return null;
+    return rows[0].user_id;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function createCallLog(fromCallId, toCallId) {
+  const callerId = await resolveUserIdByCallId(fromCallId);
+  const receiverId = await resolveUserIdByCallId(toCallId);
+  if (!callerId || !receiverId) return null;
+
+  const pool = getPool();
+  const [result] = await pool.execute(
+    "INSERT INTO calls (caller_id, receiver_id, call_status, started_at) VALUES (?, ?, 'ongoing', NOW())",
+    [callerId, receiverId]
+  );
+  return result?.insertId ?? null;
+}
+
+async function finalizeCallLog(callDbId, status) {
+  if (!callDbId) return;
+  try {
+    const pool = getPool();
+    await pool.execute(
+      'UPDATE calls SET call_status = ?, ended_at = NOW() WHERE call_id = ?',
+      [status, callDbId]
+    );
+  } catch (_) {}
+}
+
+function markBusyPair(a, b) {
+  if (!a || !b) return;
+  busyUsers.add(a);
+  busyUsers.add(b);
+  activePeer[a] = b;
+  activePeer[b] = a;
+}
+
+function clearBusy(userId) {
+  if (!userId) return;
+  const other = activePeer[userId];
+  busyUsers.delete(userId);
+  delete activePeer[userId];
+  if (other) {
+    busyUsers.delete(other);
+    delete activePeer[other];
+  }
+}
+
 function getJwtSecret() {
   const secret = process.env.JWT_SECRET;
   if (!secret) {
@@ -325,8 +395,12 @@ app.get('/api/calls', authMiddleware, async (req, res) => {
         receiver_id,
         call_status,
         started_at,
-        ended_at
+        ended_at,
+        cu.call_user_id AS caller_call_user_id,
+        ru.call_user_id AS receiver_call_user_id
       FROM calls
+      JOIN users cu ON cu.user_id = calls.caller_id
+      JOIN users ru ON ru.user_id = calls.receiver_id
       WHERE caller_id = ? OR receiver_id = ?
       ORDER BY started_at DESC, call_id DESC`,
       [req.user.user_id, req.user.user_id]
@@ -397,8 +471,46 @@ io.on("connection", (socket) => {
 
   // Call someone
   socket.on("callUser", ({ userToCall, signalData, from }) => {
+    if (!userToCall || !from) return;
+
+    // Caller is already busy
+    if (busyUsers.has(from)) {
+      if (onlineUsers[from]) {
+        io.to(onlineUsers[from]).emit("callFailed", { from: userToCall, reason: 'busy' });
+      }
+      return;
+    }
+
+    // Callee is busy
+    if (busyUsers.has(userToCall)) {
+      if (onlineUsers[from]) {
+        io.to(onlineUsers[from]).emit("callFailed", { from: userToCall, reason: 'busy' });
+      }
+
+      // Log as missed (busy)
+      createCallLog(from, userToCall).then((callDbId) => finalizeCallLog(callDbId, 'missed'));
+      return;
+    }
+
     if (onlineUsers[userToCall]) {
+      // mark both busy as soon as call is initiated to avoid multiple incoming calls
+      markBusyPair(from, userToCall);
+
+      // Create call log row
+      createCallLog(from, userToCall).then((callDbId) => {
+        if (!callDbId) return;
+        activeCallDbId[pairKey(from, userToCall)] = callDbId;
+        activeCallDbId[pairKey(userToCall, from)] = callDbId;
+      });
+
       io.to(onlineUsers[userToCall]).emit("incomingCall", { signal: signalData, from });
+    } else {
+      if (onlineUsers[from]) {
+        io.to(onlineUsers[from]).emit("callFailed", { from: userToCall, reason: 'offline' });
+      }
+
+      // Log as missed (offline)
+      createCallLog(from, userToCall).then((callDbId) => finalizeCallLog(callDbId, 'missed'));
     }
   });
 
@@ -411,13 +523,48 @@ io.on("connection", (socket) => {
 
   // Reject call
   socket.on("rejectCall", ({ to, from, reason }) => {
+    const callDbId = activeCallDbId[pairKey(from, to)];
+    delete activeCallDbId[pairKey(from, to)];
+    delete activeCallDbId[pairKey(to, from)];
+    finalizeCallLog(callDbId, 'missed');
+
+    // clear busy for both ends
+    clearBusy(to);
+    clearBusy(from);
     if (onlineUsers[to]) {
       io.to(onlineUsers[to]).emit("callRejected", { from, reason: reason || 'rejected' });
     }
   });
 
+  // Caller cancels before callee answers
+  socket.on('cancelCall', ({ to, from }) => {
+    if (!to || !from) return;
+
+    const callDbId = activeCallDbId[pairKey(from, to)];
+    delete activeCallDbId[pairKey(from, to)];
+    delete activeCallDbId[pairKey(to, from)];
+    finalizeCallLog(callDbId, 'missed');
+
+    clearBusy(to);
+    clearBusy(from);
+
+    if (onlineUsers[to]) {
+      io.to(onlineUsers[to]).emit('callCanceled', { from });
+      // Backward compatible: older clients only listen for callEnded
+      io.to(onlineUsers[to]).emit('callEnded', { from });
+    }
+  });
+
   // Call failed (timeout/ICE failure/etc)
   socket.on("callFailed", ({ to, from, reason }) => {
+    const callDbId = activeCallDbId[pairKey(from, to)];
+    delete activeCallDbId[pairKey(from, to)];
+    delete activeCallDbId[pairKey(to, from)];
+    finalizeCallLog(callDbId, 'missed');
+
+    // clear busy for both ends
+    clearBusy(to);
+    clearBusy(from);
     if (onlineUsers[to]) {
       io.to(onlineUsers[to]).emit("callFailed", { from, reason: reason || 'failed' });
     }
@@ -432,11 +579,29 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     for (let user in onlineUsers) {
-      if (onlineUsers[user] === socket.id) delete onlineUsers[user];
+      if (onlineUsers[user] === socket.id) {
+        delete onlineUsers[user];
+        // If a user disappears while busy, clear their busy pair. Call will be marked missed
+        const other = activePeer[user];
+        const callDbId = other ? activeCallDbId[pairKey(user, other)] : null;
+        if (other) {
+          delete activeCallDbId[pairKey(user, other)];
+          delete activeCallDbId[pairKey(other, user)];
+        }
+        finalizeCallLog(callDbId, 'missed');
+        clearBusy(user);
+      }
     }
   });
 
   socket.on("endCall", ({ to, from }) => {
+    const callDbId = activeCallDbId[pairKey(from, to)];
+    delete activeCallDbId[pairKey(from, to)];
+    delete activeCallDbId[pairKey(to, from)];
+    finalizeCallLog(callDbId, 'completed');
+
+    clearBusy(to);
+    clearBusy(from);
     if (onlineUsers[to]) {
       io.to(onlineUsers[to]).emit("callEnded", { from });
     }

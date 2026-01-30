@@ -1,12 +1,21 @@
 import 'dart:async';
 import 'dart:convert';
-
+import 'dart:io';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:hive/hive.dart';
+import 'package:socket_io_client/socket_io_client.dart' as IO;
+import 'package:hive_flutter/hive_flutter.dart';
 import 'package:http/http.dart' as http;
+import 'package:vibration/vibration.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'auth_service.dart';
 import 'call_service.dart';
 import 'calling_interface.dart';
+import 'profile_screen.dart';
+import 'call_log_screen.dart';
+import 'set_call_id_screen.dart';
+import 'main.dart';
 import 'sound_manager.dart';
 
 /// Main calling screen with UI for making and receiving calls
@@ -36,6 +45,8 @@ class _CallScreenState extends State<CallScreen> {
   bool _isSearchingUsers = false;
   List<Map<String, dynamic>> _searchResults = const [];
   String? _searchError;
+  String _myCallId = '';
+  String? _lastShownError;
   
   bool _isInitialized = false;
   bool _showCallingInterface = false;
@@ -43,13 +54,62 @@ class _CallScreenState extends State<CallScreen> {
   Map<String, dynamic>? _incomingCallOffer;
   String? _incomingCallId;
   MediaStream? _remoteStream;
+  bool _isIncomingDialogVisible = false;
+  Timer? _vibrationTimer;
+  Timer? _notificationTimer;
+  int _notificationId = 0;
+  final FlutterLocalNotificationsPlugin _notificationsPlugin = FlutterLocalNotificationsPlugin();
 
   @override
   void initState() {
     super.initState();
+    _myCallId = widget.userId;
     _setupListeners();
     _initContacts();
+    _initNotifications();
   }
+
+  @override
+  void didUpdateWidget(covariant CallScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_myCallId.isEmpty || _myCallId == oldWidget.userId) {
+      _myCallId = widget.userId;
+    }
+  }
+
+  Future<void> _openProfile() async {
+    if (_callService.callState != CallState.idle) {
+      _showErrorDialog('End the call before opening profile');
+      return;
+    }
+
+    final newId = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (_) => ProfileScreen(
+          primaryBaseUrl: widget.primaryBaseUrl,
+          fallbackBaseUrl: widget.fallbackBaseUrl,
+        ),
+      ),
+    );
+
+    final trimmed = newId?.trim();
+    if (trimmed == null || trimmed.isEmpty) return;
+    if (mounted) {
+      setState(() {
+        _myCallId = trimmed;
+      });
+    }
+
+    try {
+      try {
+        await _callService.initialize(trimmed, serverUrl: widget.primaryBaseUrl);
+      } catch (_) {
+        await _callService.initialize(trimmed, serverUrl: widget.fallbackBaseUrl);
+      }
+    } catch (_) {}
+  }
+
+  String get _effectiveMyCallId => _myCallId.isNotEmpty ? _myCallId : widget.userId;
 
   Future<void> _searchUsers(String query) async {
     final q = query.trim();
@@ -113,6 +173,7 @@ class _CallScreenState extends State<CallScreen> {
           final map = Map<String, dynamic>.from(item);
           final callId = (map['call_user_id'] ?? '').toString().trim();
           if (callId.isEmpty) continue;
+          if (callId.toLowerCase() == _effectiveMyCallId.toLowerCase()) continue;
           results.add({
             'call_user_id': callId,
             'user_id': map['user_id'],
@@ -163,11 +224,74 @@ class _CallScreenState extends State<CallScreen> {
     return false;
   }
 
+  Future<void> _editCallId() async {
+    if (_callService.callState != CallState.idle) {
+      _showErrorDialog('End the call before changing your ID');
+      return;
+    }
+
+    final result = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (_) => SetCallIdScreen(baseUrl: widget.primaryBaseUrl),
+      ),
+    );
+
+    final newId = result?.trim();
+    if (newId == null || newId.isEmpty) return;
+
+    if (mounted) {
+      setState(() {
+        _myCallId = newId;
+      });
+    }
+
+    try {
+      try {
+        await _callService.initialize(newId, serverUrl: widget.primaryBaseUrl);
+      } catch (_) {
+        await _callService.initialize(newId, serverUrl: widget.fallbackBaseUrl);
+      }
+    } catch (_) {
+    }
+
+    _targetUserIdController.clear();
+    if (mounted) {
+      setState(() {
+        _searchResults = const [];
+        _searchError = null;
+      });
+    }
+  }
+
   @override
   void dispose() {
     _searchDebounce?.cancel();
     _targetUserIdController.dispose();
+    _vibrationTimer?.cancel();
+    _notificationTimer?.cancel();
     super.dispose();
+  }
+
+  Future<void> _initNotifications() async {
+    if (!kIsWeb) {
+      const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+      const iosSettings = DarwinInitializationSettings(
+        requestAlertPermission: true,
+        requestBadgePermission: true,
+        requestSoundPermission: true,
+      );
+      const initSettings = InitializationSettings(
+        android: androidSettings,
+        iOS: iosSettings,
+      );
+      
+      await _notificationsPlugin.initialize(
+        initSettings,
+        onDidReceiveNotificationResponse: (NotificationResponse response) {
+          // Handle notification tap
+        },
+      );
+    }
   }
 
   Future<void> _initContacts() async {
@@ -450,9 +574,36 @@ class _CallScreenState extends State<CallScreen> {
   void _setupListeners() {
     _callService.callStateStream.listen((state) {
       if (!mounted) return;
+      final err = state['error']?.toString();
+      if (err != null && err.isNotEmpty && err != _lastShownError) {
+        _lastShownError = err;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(err),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
       setState(() {
         _showCallingInterface = state['callState'] != CallState.idle;
       });
+
+      final cs = state['callState'];
+      final error = state['error'] as String?;
+      
+      // Only dismiss dialog on specific cancellation errors
+      if (cs == CallState.idle && _isIncomingDialogVisible && 
+          error != null && error.isNotEmpty) {
+        // Check for specific cancellation messages
+        if (error.toLowerCase().contains('canceled') || 
+            error.toLowerCase().contains('rejected') ||
+            error.toLowerCase().contains('failed') ||
+            error.toLowerCase().contains('busy') ||
+            error.toLowerCase().contains('offline')) {
+          _dismissIncomingCallDialog();
+        }
+      }
     });
 
     _callService.incomingCallStream.listen((callData) {
@@ -478,10 +629,118 @@ class _CallScreenState extends State<CallScreen> {
     });
   }
 
+  /// Start vibration and notification for incoming call
+  void _startIncomingCallAlerts() {
+    if (!kIsWeb && _currentCallTarget != null) {
+      // Start vibration pattern
+      _vibrationTimer?.cancel();
+      _vibrationTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+        if (await Vibration.hasVibrator() ?? false) {
+          await Vibration.vibrate(pattern: [0, 500, 500, 500]);
+        }
+      });
+
+      // Show persistent notification
+      _showIncomingCallNotification();
+    }
+  }
+
+  /// Stop vibration and notifications
+  void _stopIncomingCallAlerts() {
+    _vibrationTimer?.cancel();
+    _notificationTimer?.cancel();
+    _notificationsPlugin.cancel(_notificationId);
+  }
+
+  /// Show incoming call notification
+  Future<void> _showIncomingCallNotification() async {
+    if (!kIsWeb && _currentCallTarget != null) {
+      const androidDetails = AndroidNotificationDetails(
+        'incoming_calls',
+        'Incoming Calls',
+        channelDescription: 'Notifications for incoming calls',
+        importance: Importance.max,
+        priority: Priority.high,
+        ongoing: true,
+        autoCancel: false,
+        category: AndroidNotificationCategory.call,
+        fullScreenIntent: true,
+      );
+      
+      const iosDetails = DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+        categoryIdentifier: 'incoming_call',
+      );
+      
+      const details = NotificationDetails(
+        android: androidDetails,
+        iOS: iosDetails,
+      );
+
+      await _notificationsPlugin.show(
+        _notificationId,
+        'Incoming Call',
+        'Call from $_currentCallTarget',
+        details,
+      );
+    }
+  }
+
+  /// Dismiss incoming call dialog using multiple fallback methods
+  void _dismissIncomingCallDialog({bool keepCallTarget = false}) {
+    if (!_isIncomingDialogVisible) return;
+    
+    // Stop vibration and notifications first
+    _stopIncomingCallAlerts();
+    
+    // Use WidgetsBinding to ensure this runs after the current frame
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        // Method 1: Use global navigator key
+        if (navigatorKey.currentContext != null) {
+          Navigator.of(navigatorKey.currentContext!).pop();
+        }
+      } catch (_) {
+        try {
+          // Method 2: Use root navigator with context (if mounted)
+          if (mounted) {
+            Navigator.of(context, rootNavigator: true).pop();
+          }
+        } catch (_) {
+          try {
+            // Method 3: Use regular navigator (if mounted)
+            if (mounted) {
+              Navigator.of(context).pop();
+            }
+          } catch (_) {}
+        }
+      }
+      
+      _isIncomingDialogVisible = false;
+      if (mounted) {
+        setState(() {
+          if (!keepCallTarget) {
+            _currentCallTarget = null;
+          }
+          _incomingCallOffer = null;
+          _incomingCallId = null;
+        });
+      }
+    });
+  }
+
   /// Show incoming call dialog
   void _showIncomingCallDialog() {
+    _isIncomingDialogVisible = true;
+    
+    // Start vibration and notifications for mobile
+    _startIncomingCallAlerts();
+    
     showDialog(
       context: context,
+      useRootNavigator: true,
       barrierDismissible: false,
       builder: (BuildContext context) {
         return WillPopScope(
@@ -529,10 +788,7 @@ class _CallScreenState extends State<CallScreen> {
                         width: 60,
                         height: 60,
                         child: ElevatedButton(
-                          onPressed: () {
-                            Navigator.of(context).pop();
-                            _rejectIncomingCall();
-                          },
+                          onPressed: _rejectIncomingCall,
                           style: ElevatedButton.styleFrom(
                             backgroundColor: Colors.red,
                             foregroundColor: Colors.white,
@@ -548,10 +804,7 @@ class _CallScreenState extends State<CallScreen> {
                         width: 60,
                         height: 60,
                         child: ElevatedButton(
-                          onPressed: () {
-                            Navigator.of(context).pop();
-                            _acceptIncomingCall();
-                          },
+                          onPressed: _acceptIncomingCall,
                           style: ElevatedButton.styleFrom(
                             backgroundColor: Colors.green,
                             foregroundColor: Colors.white,
@@ -569,6 +822,21 @@ class _CallScreenState extends State<CallScreen> {
           ),
         );
       },
+    ).then((_) {
+      _isIncomingDialogVisible = false;
+      // Stop alerts when dialog is closed
+      _stopIncomingCallAlerts();
+    });
+  }
+
+  Future<void> _openCallLog() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => CallLogScreen(
+          primaryBaseUrl: widget.primaryBaseUrl,
+          fallbackBaseUrl: widget.fallbackBaseUrl,
+        ),
+      ),
     );
   }
 
@@ -577,6 +845,9 @@ class _CallScreenState extends State<CallScreen> {
     if (_currentCallTarget == null || _incomingCallOffer == null || _incomingCallId == null) {
       return;
     }
+
+    // Dismiss the dialog immediately but keep the call target
+    _dismissIncomingCallDialog(keepCallTarget: true);
 
     try {
       await _callService.acceptCall(
@@ -600,6 +871,9 @@ class _CallScreenState extends State<CallScreen> {
       return;
     }
 
+    // Dismiss the dialog immediately
+    _dismissIncomingCallDialog();
+    
     _callService.rejectCall(_currentCallTarget!, _incomingCallId!);
     
     setState(() {
@@ -699,8 +973,20 @@ class _CallScreenState extends State<CallScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('Calling System - ${widget.userId}'),
+        title: Text('Calling System - $_effectiveMyCallId'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(
+            tooltip: 'Call Log',
+            onPressed: _openCallLog,
+            icon: const Icon(Icons.history),
+          ),
+          IconButton(
+            tooltip: 'Profile',
+            onPressed: _openProfile,
+            icon: const Icon(Icons.account_circle),
+          ),
+        ],
       ),
       body: Column(
         children: [

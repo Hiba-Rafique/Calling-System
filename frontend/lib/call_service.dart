@@ -41,6 +41,7 @@ class CallService {
   CallState _callState = CallState.idle;
   final StreamController<Map<String, dynamic>> _callStateController = StreamController.broadcast();
   final StreamController<Map<String, dynamic>> _incomingCallController = StreamController.broadcast();
+  String? _lastError;
 
   DateTime? _callConnectedAt;
   Duration _callDuration = Duration.zero;
@@ -78,6 +79,7 @@ class CallService {
   bool get isMuted => _isMuted;
   bool get isSpeakerOn => _isSpeakerOn;
   bool get isVideoCall => _isVideoCall;
+  String? get lastError => _lastError;
   bool get isCameraOn => _isCameraOn;
   bool get isScreenSharing => _isScreenSharing;
 
@@ -374,7 +376,7 @@ class CallService {
     
     // Handle call answers
     _socket!.on('callAccepted', (data) async {
-      debugPrint('Call answered by: ${_remoteUserId}');
+      debugPrint('Call answered by: ${_remoteUserId}, data: $data');
       await _handleAnswer(data); // Backend sends signal directly
     });
     
@@ -398,6 +400,21 @@ class CallService {
       }
       _endCall();
     });
+
+    _socket!.on('callCanceled', (data) {
+      final from = data is Map ? data['from']?.toString() : null;
+      debugPrint('Call canceled by: $from');
+
+      if (_callState == CallState.idle) return;
+      if (from != null && from != _remoteUserId) {
+        debugPrint('callCanceled from unexpected user ($from); ignoring');
+        return;
+      }
+
+      SoundManager().stopRingingSound();
+      _lastError = 'Call canceled';
+      _endCall();
+    });
     
     // Handle call rejected
     _socket!.on('callRejected', (data) {
@@ -415,6 +432,14 @@ class CallService {
       if (from != null && from != _remoteUserId) {
         debugPrint('callFailed from unexpected user ($from); ignoring');
         return;
+      }
+
+      if (reason == 'busy') {
+        _lastError = 'User is busy';
+      } else if (reason == 'offline') {
+        _lastError = 'User is offline';
+      } else {
+        _lastError = 'Call failed';
       }
 
       SoundManager().playCallEndedSound();
@@ -568,7 +593,6 @@ class CallService {
           .map((t) => '${t.kind}(enabled=${t.enabled})')
           .toList();
       debugPrint('Local tracks: $localTrackInfo');
-      
       debugPrint('WebRTC initialized successfully');
     } catch (e) {
       debugPrint('Failed to initialize WebRTC: $e');
@@ -698,6 +722,7 @@ class CallService {
       await _peerConnection!.setLocalDescription(answer);
       
       // Send answer to caller
+      debugPrint('Sending answer to $from: ${answer.toMap()}');
       _socket!.emit('answerCall', {
         'to': from, // Backend expects 'to'
         'signal': answer.toMap(), // Backend expects 'signal'
@@ -755,32 +780,51 @@ class CallService {
   }
 
   /// Handle incoming answer
-  Future<void> _handleAnswer(Map<String, dynamic> signalData) async {
+  Future<void> _handleAnswer(dynamic payload) async {
     try {
+      final Map<String, dynamic>? signalData = payload is Map
+          ? Map<String, dynamic>.from(payload as Map)
+          : null;
+
+      debugPrint('_handleAnswer called with payloadType=${payload.runtimeType} payload=$payload');
+      debugPrint('_peerConnection is null: ${_peerConnection == null}');
+      debugPrint('_callState: $_callState');
+
+      if (_peerConnection == null) {
+        throw Exception('Peer connection is null when handling answer');
+      }
+      if (signalData == null) {
+        throw Exception('Answer payload is not a Map: ${payload.runtimeType}');
+      }
+
       // Cancel dialing timer
       _dialingTimer?.cancel();
       _dialingTimer = null;
-      
+
       // Update state to connecting
       _updateCallState(CallState.connecting);
-      
-      debugPrint('Received answer data: $signalData');
-      
+
       // Handle different possible data structures from backend
-      String sdp;
-      String type;
-      
-      if (signalData.containsKey('sdp') && signalData.containsKey('type')) {
+      String? sdp;
+      String? type;
+
+      debugPrint('Parsing answer data - keys: ${signalData.keys}');
+
+      if (signalData['sdp'] is String && signalData['type'] is String) {
         // Direct structure: {sdp: "...", type: "answer"}
-        sdp = signalData['sdp'];
-        type = signalData['type'];
-      } else if (signalData.containsKey('signal')) {
+        sdp = signalData['sdp'] as String;
+        type = signalData['type'] as String;
+      } else if (signalData['signal'] is Map) {
         // Nested structure: {signal: {sdp: "...", type: "answer"}}
-        final signal = signalData['signal'];
-        sdp = signal['sdp'];
-        type = signal['type'];
-      } else {
-        throw Exception('Invalid answer data structure: $signalData');
+        final nested = Map<String, dynamic>.from(signalData['signal'] as Map);
+        if (nested['sdp'] is String && nested['type'] is String) {
+          sdp = nested['sdp'] as String;
+          type = nested['type'] as String;
+        }
+      }
+
+      if (sdp == null || type == null) {
+        throw Exception('Invalid answer payload (missing sdp/type). keys=${signalData.keys} payload=$signalData');
       }
       
       // Check current remote description before setting
@@ -793,8 +837,11 @@ class CallService {
       }
       
       await _peerConnection!.setRemoteDescription(
-        RTCSessionDescription(sdp, type)
+        RTCSessionDescription(sdp, type),
       );
+
+      // Caller side: candidates can arrive before the answer. Process buffered candidates now.
+      await _processBufferedIceCandidates();
 
       if (!kIsWeb) {
         try {
@@ -809,9 +856,9 @@ class CallService {
       }
       
       debugPrint('Call answered successfully');
-    } catch (e) {
+    } catch (e, st) {
       _failCall('answer_failed');
-      debugPrint('Failed to handle answer: $e');
+      debugPrint('Failed to handle answer: $e\n$st');
     }
   }
 
@@ -887,6 +934,7 @@ class CallService {
   void _sendIceCandidate(RTCIceCandidate candidate) {
     if (_remoteUserId == null) return;
     
+    debugPrint('Sending ICE candidate to $_remoteUserId: ${candidate.toMap()}');
     _socket!.emit('iceCandidate', {
       'to': _remoteUserId, // Backend expects 'to'
       'candidate': candidate.toMap(),
@@ -896,10 +944,18 @@ class CallService {
   /// End the current call
   void endCall() {
     if (_remoteUserId != null && _socket != null) {
-      _socket!.emit('endCall', {
-        'to': _remoteUserId,
-        'from': _currentUserId,
-      });
+      // If we're still dialing (callee hasn't answered yet), treat this as cancel
+      if (_callState == CallState.dialing || _callState == CallState.connecting) {
+        _socket!.emit('cancelCall', {
+          'to': _remoteUserId,
+          'from': _currentUserId,
+        });
+      } else {
+        _socket!.emit('endCall', {
+          'to': _remoteUserId,
+          'from': _currentUserId,
+        });
+      }
     }
     _endCall();
   }
@@ -967,7 +1023,12 @@ class CallService {
       'isCameraOn': _isCameraOn,
       'isScreenSharing': _isScreenSharing,
       'callDurationMs': _callDuration.inMilliseconds,
+      'error': _lastError,
     });
+
+    if (newState != CallState.idle && _lastError != null) {
+      _lastError = null;
+    }
   }
 
   /// Dispose of all resources

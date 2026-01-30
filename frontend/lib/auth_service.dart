@@ -195,6 +195,8 @@ class AuthService {
       throw Exception(body['error'] ?? 'Failed to set Call ID');
     }
 
+    await saveMe(body);
+
     return body;
   }
 }

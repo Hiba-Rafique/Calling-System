@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:hive/hive.dart';
 
@@ -125,27 +126,40 @@ class AuthService {
     required String email,
     required String password,
   }) async {
-    final res = await _withFallback(
-      (url) => http.post(
-        _uri(url, '/api/auth/login'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'email': email, 'password': password}),
-      ),
-      primaryBaseUrl: baseUrl,
-    );
+    debugPrint('Attempting login to: $baseUrl');
+    try {
+      final res = await _withFallback(
+        (url) {
+          debugPrint('Sending login request to: $url');
+          return http.post(
+            _uri(url, '/api/auth/login'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'email': email, 'password': password}),
+          );
+        },
+        primaryBaseUrl: baseUrl,
+      );
 
-    final Map<String, dynamic> body = _tryDecodeJsonObject(res);
+      debugPrint('Login response status: ${res.statusCode}');
+      debugPrint('Login response body: ${res.body}');
 
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception(body['error'] ?? 'Login failed');
+      final Map<String, dynamic> body = _tryDecodeJsonObject(res);
+
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throw Exception(body['error'] ?? 'Login failed');
+      }
+
+      final token = body['token'];
+      if (token is String && token.isNotEmpty) {
+        await saveToken(token);
+        debugPrint('Token saved successfully');
+      }
+
+      return body;
+    } catch (e) {
+      debugPrint('Login error: $e');
+      rethrow;
     }
-
-    final token = body['token'];
-    if (token is String && token.isNotEmpty) {
-      await saveToken(token);
-    }
-
-    return body;
   }
 
   Future<Map<String, dynamic>> me({

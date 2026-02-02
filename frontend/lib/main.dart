@@ -71,22 +71,39 @@ class _AppNavigatorState extends State<AppNavigator> {
 
   Future<void> _bootstrapAuth() async {
     try {
+      debugPrint('Bootstrapping auth...');
       final token = await _authService.getToken();
       if (token == null || token.isEmpty) {
+        debugPrint('No token found, showing login screen');
         return;
       }
+      debugPrint('Token found, validating with server...');
 
-      final me = await _authService.me(baseUrl: _primaryBaseUrl, token: token);
-      await _handleLoggedIn(me);
+      try {
+        debugPrint('Trying primary URL: $_primaryBaseUrl');
+        final me = await _authService.me(baseUrl: _primaryBaseUrl, token: token);
+        debugPrint('Successfully authenticated with primary URL');
+        await _handleLoggedIn(me);
+      } catch (e) {
+        debugPrint('Primary URL failed: $e');
+        debugPrint('Trying fallback URL: $_fallbackBaseUrl');
+        final me = await _authService.me(baseUrl: _fallbackBaseUrl, token: token);
+        debugPrint('Successfully authenticated with fallback URL');
+        await _handleLoggedIn(me);
+      }
     } catch (e) {
+      debugPrint('All authentication attempts failed: $e');
       final cachedMe = await _authService.getCachedMe();
       if (cachedMe != null) {
+        debugPrint('Using cached user data');
         await _handleLoggedIn(cachedMe);
         return;
       }
 
       final msg = e.toString();
+      debugPrint('Auth error: $msg');
       if (msg.contains('Session expired') || msg.contains('status 401')) {
+        debugPrint('Session expired, clearing token');
         await _authService.clearToken();
       }
     } finally {

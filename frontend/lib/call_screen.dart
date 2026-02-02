@@ -14,8 +14,8 @@ import 'package:frontend/calling_interface.dart';
 import 'package:frontend/call_log_screen.dart';
 import 'package:frontend/profile_screen.dart';
 import 'package:frontend/auth_screen.dart';
-import 'package:frontend/set_call_id_screen.dart';
 import 'package:frontend/auth_service.dart';
+import 'package:frontend/set_call_id_screen.dart';
 import 'package:frontend/sound_manager.dart';
 import 'package:frontend/main.dart';
 
@@ -773,9 +773,7 @@ class _CallScreenState extends State<CallScreen> {
     _stopIncomingCallAlerts();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       try {
-        if (navigatorKey.currentContext != null) {
-          Navigator.of(navigatorKey.currentContext!).pop();
-        } else if (mounted) {
+        if (mounted) {
           Navigator.of(context, rootNavigator: true).pop();
         }
       } catch (_) {}
@@ -881,8 +879,24 @@ class _CallScreenState extends State<CallScreen> {
 
   /// Dismiss incoming call dialog using multiple fallback methods
   void _dismissIncomingCallDialog({bool keepCallTarget = false}) {
-    debugPrint('DISMISSING INCOMING CALL DIALOG - _isIncomingDialogVisible: $_isIncomingDialogVisible');
-    if (_isIncomingDialogVisible) {
+    if (!_isIncomingDialogVisible) return;
+    
+    // Stop vibration and notifications first
+    _stopIncomingCallAlerts();
+    
+    // Use WidgetsBinding to ensure this runs after the current frame
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        // Method 1: Use global navigator key
+        if (Navigator.canPop(context)) {
+          Navigator.of(context).pop();
+        }
+      } catch (_) {
+        try {
+          // Method 2: Use root navigator with context (if mounted)
+          if (mounted) {
+            Navigator.of(context, rootNavigator: true).pop();
+          }
         } catch (_) {
           try {
             // Method 3: Use regular navigator (if mounted)

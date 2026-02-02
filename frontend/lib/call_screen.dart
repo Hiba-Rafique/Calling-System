@@ -1,22 +1,23 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
-import 'package:hive_flutter/hive_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:vibration/vibration.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'auth_service.dart';
-import 'call_service.dart';
-import 'calling_interface.dart';
-import 'profile_screen.dart';
-import 'call_log_screen.dart';
-import 'set_call_id_screen.dart';
-import 'main.dart';
-import 'sound_manager.dart';
+import 'package:hive/hive.dart';
+import 'package:frontend/call_service.dart';
+import 'package:frontend/calling_interface.dart';
+import 'package:frontend/call_log_screen.dart';
+import 'package:frontend/profile_screen.dart';
+import 'package:frontend/auth_screen.dart';
+import 'package:frontend/set_call_id_screen.dart';
+import 'package:frontend/auth_service.dart';
+import 'package:frontend/sound_manager.dart';
+import 'package:frontend/main.dart';
 
 /// Main calling screen with UI for making and receiving calls
 class CallScreen extends StatefulWidget {
@@ -37,6 +38,7 @@ class CallScreen extends StatefulWidget {
 
 class _CallScreenState extends State<CallScreen> {
   final CallService _callService = CallService();
+  final AuthService _authService = AuthService();
   final TextEditingController _targetUserIdController = TextEditingController();
   Box<dynamic>? _contactsBox;
   dynamic _contacts = const [];
@@ -53,6 +55,10 @@ class _CallScreenState extends State<CallScreen> {
   String? _currentCallTarget;
   Map<String, dynamic>? _incomingCallOffer;
   String? _incomingCallId;
+
+  bool _isRoomInviteDialogVisible = false;
+  String? _pendingRoomInviteRoomId;
+  String? _pendingRoomInviteFrom;
   MediaStream? _remoteStream;
   bool _isIncomingDialogVisible = false;
   Timer? _vibrationTimer;
@@ -64,6 +70,7 @@ class _CallScreenState extends State<CallScreen> {
   void initState() {
     super.initState();
     _myCallId = widget.userId;
+    _initializeCallService();
     _setupListeners();
     _initContacts();
     _initNotifications();
@@ -74,6 +81,7 @@ class _CallScreenState extends State<CallScreen> {
     super.didUpdateWidget(oldWidget);
     if (_myCallId.isEmpty || _myCallId == oldWidget.userId) {
       _myCallId = widget.userId;
+      _initializeCallService();
     }
   }
 
@@ -83,7 +91,7 @@ class _CallScreenState extends State<CallScreen> {
       return;
     }
 
-    final newId = await Navigator.of(context).push<String>(
+    await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => ProfileScreen(
           primaryBaseUrl: widget.primaryBaseUrl,
@@ -91,25 +99,78 @@ class _CallScreenState extends State<CallScreen> {
         ),
       ),
     );
+  }
 
-    final trimmed = newId?.trim();
-    if (trimmed == null || trimmed.isEmpty) return;
-    if (mounted) {
-      setState(() {
-        _myCallId = trimmed;
-      });
+  Future<void> _signOut() async {
+    if (_callService.callState != CallState.idle) {
+      _showErrorDialog('End the call before signing out');
+      return;
     }
 
-    try {
-      try {
-        await _callService.initialize(trimmed, serverUrl: widget.primaryBaseUrl);
-      } catch (_) {
-        await _callService.initialize(trimmed, serverUrl: widget.fallbackBaseUrl);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Sign Out'),
+        content: const Text('Are you sure you want to sign out?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Sign Out'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      // Clear stored authentication data
+      final box = await Hive.openBox('auth');
+      await box.clear();
+      
+      // Dispose call service
+      _callService.dispose();
+      
+      // Navigate to auth screen
+      if (mounted) {
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(
+            builder: (_) => AuthScreen(
+              baseUrl: widget.primaryBaseUrl,
+              onLoggedIn: (me) async {
+                // This will be handled by the parent widget
+              },
+            ),
+          ),
+          (route) => false,
+        );
       }
-    } catch (_) {}
+    }
   }
 
   String get _effectiveMyCallId => _myCallId.isNotEmpty ? _myCallId : widget.userId;
+
+  Future<void> _initializeCallService() async {
+    final id = _effectiveMyCallId;
+    if (id.isEmpty) return;
+    debugPrint('Initializing CallService for user: $id');
+    try {
+      debugPrint('Trying primaryBaseUrl: ${widget.primaryBaseUrl}');
+      await _callService.initialize(id, serverUrl: widget.primaryBaseUrl);
+      debugPrint('CallService initialized with primaryBaseUrl');
+    } catch (e) {
+      debugPrint('Primary failed: $e');
+      try {
+        debugPrint('Trying fallbackBaseUrl: ${widget.fallbackBaseUrl}');
+        await _callService.initialize(id, serverUrl: widget.fallbackBaseUrl);
+        debugPrint('CallService initialized with fallbackBaseUrl');
+      } catch (e2) {
+        debugPrint('Fallback also failed: $e2');
+      }
+    }
+  }
 
   Future<void> _searchUsers(String query) async {
     final q = query.trim();
@@ -622,6 +683,32 @@ class _CallScreenState extends State<CallScreen> {
       _showIncomingCallDialog();
     });
 
+    _callService.roomInviteStream.listen((data) {
+      if (!mounted) return;
+      final type = data['type']?.toString();
+
+      if (type == 'canceled' || type == 'declined' || type == 'failed') {
+        if (_isRoomInviteDialogVisible) {
+          _dismissRoomInviteDialog();
+        }
+        return;
+      }
+
+      final roomId = data['roomId']?.toString();
+      final from = data['from']?.toString();
+      if (roomId == null || roomId.isEmpty || from == null || from.isEmpty) return;
+
+      if (_isRoomInviteDialogVisible) return;
+      if (_showCallingInterface) return;
+      if (_isIncomingDialogVisible) return;
+
+      setState(() {
+        _pendingRoomInviteRoomId = roomId;
+        _pendingRoomInviteFrom = from;
+      });
+      _showRoomInviteDialog();
+    });
+
     _callService.remoteStreamStream.listen((stream) {
       if (!mounted) return;
       setState(() {
@@ -632,6 +719,105 @@ class _CallScreenState extends State<CallScreen> {
     setState(() {
       _isInitialized = true;
     });
+  }
+
+  void _showRoomInviteDialog() {
+    if (_pendingRoomInviteRoomId == null || _pendingRoomInviteFrom == null) return;
+    _isRoomInviteDialogVisible = true;
+
+    if (!kIsWeb) {
+      final previous = _currentCallTarget;
+      _currentCallTarget = _pendingRoomInviteFrom;
+      _startIncomingCallAlerts();
+      _currentCallTarget = previous;
+    }
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: Colors.black,
+          title: const Text(
+            'Group Call Invite',
+            style: TextStyle(color: Colors.white),
+          ),
+          content: Text(
+            'Invite from ${_pendingRoomInviteFrom!}',
+            style: const TextStyle(color: Colors.white70),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                _declineRoomInvite();
+              },
+              child: const Text('Decline', style: TextStyle(color: Colors.redAccent)),
+            ),
+            TextButton(
+              onPressed: () {
+                _acceptRoomInvite();
+              },
+              child: const Text('Accept', style: TextStyle(color: Colors.greenAccent)),
+            ),
+          ],
+        );
+      },
+    ).then((_) {
+      _isRoomInviteDialogVisible = false;
+      _stopIncomingCallAlerts();
+    });
+  }
+
+  void _dismissRoomInviteDialog() {
+    if (!_isRoomInviteDialogVisible) return;
+    _stopIncomingCallAlerts();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        if (navigatorKey.currentContext != null) {
+          Navigator.of(navigatorKey.currentContext!).pop();
+        } else if (mounted) {
+          Navigator.of(context, rootNavigator: true).pop();
+        }
+      } catch (_) {}
+    });
+    _isRoomInviteDialogVisible = false;
+  }
+
+  Future<void> _acceptRoomInvite() async {
+    final rid = _pendingRoomInviteRoomId;
+    final from = _pendingRoomInviteFrom;
+    if (rid == null || from == null) return;
+
+    _dismissRoomInviteDialog();
+
+    try {
+      await _callService.acceptRoomInvite(rid);
+      if (mounted) {
+        setState(() {
+          _currentCallTarget = from;
+          _incomingCallOffer = null;
+          _incomingCallId = null;
+          _showCallingInterface = true;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        _showErrorDialog('Failed to join call: ${e.toString()}');
+      }
+    }
+  }
+
+  void _declineRoomInvite() {
+    final rid = _pendingRoomInviteRoomId;
+    _dismissRoomInviteDialog();
+    if (rid == null) return;
+    _callService.declineRoomInvite(rid);
+    if (mounted) {
+      setState(() {
+        _pendingRoomInviteRoomId = null;
+        _pendingRoomInviteFrom = null;
+      });
+    }
   }
 
   /// Start vibration and notification for incoming call
@@ -695,24 +881,8 @@ class _CallScreenState extends State<CallScreen> {
 
   /// Dismiss incoming call dialog using multiple fallback methods
   void _dismissIncomingCallDialog({bool keepCallTarget = false}) {
-    if (!_isIncomingDialogVisible) return;
-    
-    // Stop vibration and notifications first
-    _stopIncomingCallAlerts();
-    
-    // Use WidgetsBinding to ensure this runs after the current frame
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      try {
-        // Method 1: Use global navigator key
-        if (navigatorKey.currentContext != null) {
-          Navigator.of(navigatorKey.currentContext!).pop();
-        }
-      } catch (_) {
-        try {
-          // Method 2: Use root navigator with context (if mounted)
-          if (mounted) {
-            Navigator.of(context, rootNavigator: true).pop();
-          }
+    debugPrint('DISMISSING INCOMING CALL DIALOG - _isIncomingDialogVisible: $_isIncomingDialogVisible');
+    if (_isIncomingDialogVisible) {
         } catch (_) {
           try {
             // Method 3: Use regular navigator (if mounted)
@@ -952,6 +1122,8 @@ class _CallScreenState extends State<CallScreen> {
     if (_showCallingInterface && _currentCallTarget != null) {
       return CallingInterface(
         targetUserId: _currentCallTarget!,
+        primaryBaseUrl: widget.primaryBaseUrl,
+        fallbackBaseUrl: widget.fallbackBaseUrl,
         isIncoming: _incomingCallOffer != null,
         onCallEnd: _endCall,
       );
@@ -990,6 +1162,11 @@ class _CallScreenState extends State<CallScreen> {
             tooltip: 'Profile',
             onPressed: _openProfile,
             icon: const Icon(Icons.account_circle),
+          ),
+          IconButton(
+            tooltip: 'Sign Out',
+            onPressed: _signOut,
+            icon: const Icon(Icons.logout),
           ),
         ],
       ),

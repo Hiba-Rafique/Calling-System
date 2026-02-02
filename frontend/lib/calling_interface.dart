@@ -1,17 +1,27 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import 'package:http/http.dart' as http;
+
 import 'call_service.dart';
 import 'sound_manager.dart';
 
 /// Full-screen calling interface with visual feedback
 class CallingInterface extends StatefulWidget {
   final String targetUserId;
+  final String? primaryBaseUrl;
+  final String? fallbackBaseUrl;
   final bool isIncoming;
   final Function() onCallEnd;
 
   const CallingInterface({
     super.key,
     required this.targetUserId,
+    this.primaryBaseUrl,
+    this.fallbackBaseUrl,
     this.isIncoming = false,
     required this.onCallEnd,
   });
@@ -25,6 +35,16 @@ class _CallingInterfaceState extends State<CallingInterface>
   final CallService _callService = CallService();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  final TextEditingController _inviteController = TextEditingController();
+
+  Box<dynamic>? _contactsBox;
+  List<Map<String, dynamic>> _contacts = const [];
+  String? _selectedContactCallId;
+
+  Timer? _inviteSearchDebounce;
+  bool _isInviteSearching = false;
+  List<Map<String, dynamic>> _inviteSearchResults = const [];
+  String? _inviteSearchError;
   bool _isDisposed = false;
   bool _isSpeakerOn = false;
   bool _isMuted = false;
@@ -48,6 +68,43 @@ class _CallingInterfaceState extends State<CallingInterface>
     
     _initializeRenderer();
     _setupAnimations();
+    _initInviteContacts();
+  }
+
+  Future<void> _initInviteContacts() async {
+    try {
+      if (!Hive.isBoxOpen('contacts')) {
+        _contactsBox = await Hive.openBox<dynamic>('contacts');
+      } else {
+        _contactsBox = Hive.box<dynamic>('contacts');
+      }
+      _loadInviteContactsFromCache();
+    } catch (_) {}
+  }
+
+  void _loadInviteContactsFromCache() {
+    final box = _contactsBox;
+    if (box == null) return;
+    final list = <Map<String, dynamic>>[];
+    for (final key in box.keys) {
+      final val = box.get(key);
+      if (val is Map) {
+        final map = Map<String, dynamic>.from(val);
+        final callId = (map['call_user_id'] ?? map['display'] ?? '').toString().trim();
+        if (callId.isEmpty) continue;
+        list.add(map);
+      }
+    }
+    list.sort((a, b) {
+      final an = (a['display'] ?? a['call_user_id'] ?? '').toString().toLowerCase();
+      final bn = (b['display'] ?? b['call_user_id'] ?? '').toString().toLowerCase();
+      return an.compareTo(bn);
+    });
+    if (mounted) {
+      setState(() {
+        _contacts = list;
+      });
+    }
   }
 
   Future<void> _initializeRenderer() async {
@@ -122,11 +179,465 @@ class _CallingInterfaceState extends State<CallingInterface>
   @override
   void dispose() {
     _isDisposed = true;
+    _inviteSearchDebounce?.cancel();
+    _inviteController.dispose();
     _pulseController.dispose();
     _fadeController.dispose();
     _remoteRenderer.dispose();
     _localRenderer.dispose();
     super.dispose();
+  }
+
+  Uri _uri(String baseUrl, String path) {
+    final base = Uri.parse(baseUrl);
+    return base.replace(path: path);
+  }
+
+  Future<String?> _getToken() async {
+    try {
+      final authBox = Hive.box<dynamic>('auth');
+      final token = authBox.get('auth_token');
+      return token is String ? token : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<http.Response> _withFallback(
+    Future<http.Response> Function(String baseUrl) request,
+  ) async {
+    final primary = widget.primaryBaseUrl;
+    final fallback = widget.fallbackBaseUrl;
+    if (primary == null || primary.isEmpty || fallback == null || fallback.isEmpty) {
+      return request(primary ?? fallback ?? '').timeout(const Duration(seconds: 6));
+    }
+
+    try {
+      final res = await request(primary).timeout(const Duration(seconds: 6));
+      if (res.statusCode >= 500) {
+        return request(fallback).timeout(const Duration(seconds: 6));
+      }
+      return res;
+    } catch (_) {
+      return request(fallback).timeout(const Duration(seconds: 6));
+    }
+  }
+
+  void _onInviteSearchChanged(String value) {
+    _inviteSearchDebounce?.cancel();
+    _inviteSearchDebounce = Timer(const Duration(milliseconds: 300), () {
+      _searchInviteUsers(value);
+    });
+  }
+
+  Future<void> _searchInviteUsers(String query) async {
+    final q = query.trim();
+    if (q.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _inviteSearchResults = const [];
+          _inviteSearchError = null;
+          _isInviteSearching = false;
+        });
+      }
+      return;
+    }
+
+    final token = await _getToken();
+    if (token == null || token.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _inviteSearchResults = const [];
+          _inviteSearchError = 'Missing session';
+        });
+      }
+      return;
+    }
+
+    setState(() {
+      _isInviteSearching = true;
+      _inviteSearchError = null;
+    });
+
+    try {
+      final res = await _withFallback(
+        (url) => http.get(
+          _uri(url, '/api/users/search').replace(queryParameters: {'q': q}),
+          headers: {
+            'Authorization': 'Bearer $token',
+          },
+        ),
+      );
+
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        if (mounted) {
+          setState(() {
+            _inviteSearchResults = const [];
+            _inviteSearchError = 'Search failed (${res.statusCode})';
+          });
+        }
+        return;
+      }
+
+      final decoded = jsonDecode(res.body);
+      if (decoded is! List) return;
+
+      final results = <Map<String, dynamic>>[];
+      for (final item in decoded) {
+        if (item is Map) {
+          final map = Map<String, dynamic>.from(item);
+          final callId = (map['call_user_id'] ?? '').toString().trim();
+          if (callId.isEmpty) continue;
+          results.add({
+            'call_user_id': callId,
+            'first_name': map['first_name'],
+            'last_name': map['last_name'],
+          });
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _inviteSearchResults = results;
+          _inviteSearchError = results.isEmpty ? 'No matches' : null;
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _inviteSearchResults = const [];
+          _inviteSearchError = 'Search failed';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isInviteSearching = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _promptInvite() async {
+    if (_callService.callState != CallState.connected) return;
+
+    _inviteController.clear();
+    _selectedContactCallId = null;
+    if (mounted) {
+      setState(() {
+        _inviteSearchResults = const [];
+        _inviteSearchError = null;
+        _isInviteSearching = false;
+      });
+    }
+
+    final target = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (ctx) {
+        String? chosen;
+        bool useContacts = true;
+        String? selectedContact;
+
+        return StatefulBuilder(
+          builder: (ctx2, setLocal) {
+            final bottomInset = MediaQuery.of(ctx2).viewInsets.bottom;
+            final contacts = _contacts;
+
+            List<Map<String, dynamic>> filteredContacts = contacts;
+            final query = _inviteController.text.trim().toLowerCase();
+            if (useContacts && query.isNotEmpty) {
+              filteredContacts = contacts.where((c) {
+                final display = (c['display'] ?? c['call_user_id'] ?? '').toString().toLowerCase();
+                final callId = (c['call_user_id'] ?? '').toString().toLowerCase();
+                return display.contains(query) || callId.contains(query);
+              }).toList();
+            }
+
+            final canInvite = (chosen ?? _inviteController.text).trim().isNotEmpty;
+
+            return Padding(
+              padding: EdgeInsets.only(bottom: bottomInset),
+              child: SafeArea(
+                child: SizedBox(
+                  height: MediaQuery.of(ctx2).size.height * 0.72,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                        child: Row(
+                          children: [
+                            const Expanded(
+                              child: Text(
+                                'Add person',
+                                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: () => Navigator.of(ctx2).pop(),
+                              child: const Text('Close'),
+                            ),
+                          ],
+                        ),
+                      ),
+
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16),
+                        child: TextField(
+                          controller: _inviteController,
+                          decoration: InputDecoration(
+                            prefixIcon: const Icon(Icons.search),
+                            labelText: 'Search contacts or users',
+                            hintText: 'Enter Call ID',
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                          ),
+                          onChanged: (v) {
+                            chosen = v.trim();
+                            if (!useContacts) {
+                              _onInviteSearchChanged(v);
+                            }
+                            setLocal(() {});
+                          },
+                        ),
+                      ),
+
+                      const SizedBox(height: 12),
+
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16),
+                        child: SegmentedButton<bool>(
+                          segments: const [
+                            ButtonSegment<bool>(
+                              value: true,
+                              icon: Icon(Icons.people_alt),
+                              label: Text('Contacts'),
+                            ),
+                            ButtonSegment<bool>(
+                              value: false,
+                              icon: Icon(Icons.public),
+                              label: Text('Search'),
+                            ),
+                          ],
+                          selected: {useContacts},
+                          onSelectionChanged: (s) {
+                            useContacts = s.first;
+                            selectedContact = null;
+                            _selectedContactCallId = null;
+                            chosen = _inviteController.text.trim();
+                            if (!useContacts) {
+                              _onInviteSearchChanged(_inviteController.text);
+                            }
+                            setLocal(() {});
+                          },
+                        ),
+                      ),
+
+                      const SizedBox(height: 12),
+
+                      Expanded(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          child: Material(
+                            color: Colors.transparent,
+                            child: ListView(
+                              children: [
+                                if (useContacts) ...[
+                                  if (filteredContacts.isEmpty)
+                                    const Padding(
+                                      padding: EdgeInsets.all(16),
+                                      child: Text('No contacts found'),
+                                    ),
+                                  for (final c in filteredContacts)
+                                    Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      child: InkWell(
+                                        borderRadius: BorderRadius.circular(14),
+                                        onTap: () {
+                                          final callId = (c['call_user_id'] ?? c['display'] ?? '').toString().trim();
+                                          if (callId.isEmpty) return;
+                                          selectedContact = callId;
+                                          _selectedContactCallId = callId;
+                                          chosen = callId;
+                                          _inviteController.text = callId;
+                                          setLocal(() {});
+                                        },
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                                          decoration: BoxDecoration(
+                                            color: selectedContact == (c['call_user_id'] ?? c['display'])
+                                                ? Theme.of(ctx2).colorScheme.primary.withOpacity(0.12)
+                                                : Theme.of(ctx2).colorScheme.surface,
+                                            borderRadius: BorderRadius.circular(14),
+                                            border: Border.all(
+                                              color: Theme.of(ctx2).dividerColor.withOpacity(0.2),
+                                            ),
+                                          ),
+                                          child: Row(
+                                            children: [
+                                              CircleAvatar(
+                                                child: Text(
+                                                  ((c['display'] ?? c['call_user_id'] ?? 'U').toString())
+                                                      .trim()
+                                                      .toUpperCase()
+                                                      .substring(0, 1),
+                                                ),
+                                              ),
+                                              const SizedBox(width: 12),
+                                              Expanded(
+                                                child: Column(
+                                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                                  children: [
+                                                    Text(
+                                                      (c['display'] ?? c['call_user_id'] ?? '').toString(),
+                                                      maxLines: 1,
+                                                      overflow: TextOverflow.ellipsis,
+                                                      style: const TextStyle(fontWeight: FontWeight.w600),
+                                                    ),
+                                                    const SizedBox(height: 2),
+                                                    Text(
+                                                      (c['call_user_id'] ?? '').toString(),
+                                                      maxLines: 1,
+                                                      overflow: TextOverflow.ellipsis,
+                                                      style: TextStyle(
+                                                        color: Theme.of(ctx2).textTheme.bodySmall?.color,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                              if (selectedContact == (c['call_user_id'] ?? c['display']))
+                                                Icon(Icons.check_circle, color: Theme.of(ctx2).colorScheme.primary),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                ] else ...[
+                                  if (_isInviteSearching)
+                                    const Padding(
+                                      padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                                      child: LinearProgressIndicator(minHeight: 2),
+                                    ),
+                                  if (_inviteSearchError != null)
+                                    Padding(
+                                      padding: const EdgeInsets.all(16),
+                                      child: Text(_inviteSearchError!),
+                                    ),
+                                  if (_inviteSearchResults.isEmpty && !_isInviteSearching && (_inviteController.text.trim().isNotEmpty))
+                                    const Padding(
+                                      padding: EdgeInsets.all(16),
+                                      child: Text('No matches'),
+                                    ),
+                                  for (final u in _inviteSearchResults)
+                                    Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      child: InkWell(
+                                        borderRadius: BorderRadius.circular(14),
+                                        onTap: () {
+                                          final callId = (u['call_user_id'] ?? '').toString().trim();
+                                          if (callId.isEmpty) return;
+                                          chosen = callId;
+                                          _inviteController.text = callId;
+                                          setLocal(() {});
+                                        },
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                                          decoration: BoxDecoration(
+                                            color: Theme.of(ctx2).colorScheme.surface,
+                                            borderRadius: BorderRadius.circular(14),
+                                            border: Border.all(
+                                              color: Theme.of(ctx2).dividerColor.withOpacity(0.2),
+                                            ),
+                                          ),
+                                          child: Row(
+                                            children: [
+                                              CircleAvatar(
+                                                child: Text(
+                                                  ((u['first_name'] ?? 'U').toString()).trim().isNotEmpty
+                                                      ? (u['first_name'] as Object).toString().trim().toUpperCase().substring(0, 1)
+                                                      : 'U',
+                                                ),
+                                              ),
+                                              const SizedBox(width: 12),
+                                              Expanded(
+                                                child: Column(
+                                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                                  children: [
+                                                    Text(
+                                                      ('${(u['first_name'] ?? '').toString()} ${(u['last_name'] ?? '').toString()}').trim().isEmpty
+                                                          ? (u['call_user_id'] ?? '').toString()
+                                                          : ('${(u['first_name'] ?? '').toString()} ${(u['last_name'] ?? '').toString()}').trim(),
+                                                      maxLines: 1,
+                                                      overflow: TextOverflow.ellipsis,
+                                                      style: const TextStyle(fontWeight: FontWeight.w600),
+                                                    ),
+                                                    const SizedBox(height: 2),
+                                                    Text(
+                                                      (u['call_user_id'] ?? '').toString(),
+                                                      maxLines: 1,
+                                                      overflow: TextOverflow.ellipsis,
+                                                      style: TextStyle(
+                                                        color: Theme.of(ctx2).textTheme.bodySmall?.color,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                              const Icon(Icons.chevron_right),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                ]
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+                        child: FilledButton.icon(
+                          onPressed: canInvite
+                              ? () {
+                                  Navigator.of(ctx2).pop((chosen ?? _inviteController.text).trim());
+                                }
+                              : null,
+                          icon: const Icon(Icons.person_add),
+                          label: const Text('Invite'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    if (target == null || target.isEmpty) return;
+ 
+    try {
+      await _callService.inviteToCurrentRoom(target);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Invited $target')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.toString())),
+        );
+      }
+    }
   }
 
   String _getCallStatusText() {
@@ -457,6 +968,16 @@ class _CallingInterfaceState extends State<CallingInterface>
                       spacing: 16,
                       runSpacing: 16,
                       children: [
+                        if (_callService.callState == CallState.connected)
+                          _buildControlButton(
+                            icon: Icons.person_add,
+                            onPressed: () async {
+                              await SoundManager().vibrateOnce();
+                              await _promptInvite();
+                            },
+                            backgroundColor: Colors.grey[800]!,
+                          ),
+
                         if (_callService.callState == CallState.connected &&
                             _callService.isVideoCall)
                           _buildControlButton(

@@ -199,3 +199,8 @@ GoogleService-Info.plist
 *.dump
 heapdump*.hprof
 java_pid*.hprof
+
+# Service account keys and secrets
+**/service-account.json
+**/*.json
+service-account.json

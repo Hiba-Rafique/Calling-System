@@ -13,9 +13,13 @@ class SoundManager {
 
   /// Play outgoing call sound (dialing tone)
   Future<void> playDialingSound() async {
+    if (kIsWeb) {
+      await _playSystemDialingSound();
+      return;
+    }
     try {
       // Use built-in system sound for dialing
-      await _audioPlayer.play(AssetSource('sounds/dialing.mp3'));
+      await _audioPlayer.play(AssetSource('assets/sounds/dialing.mp3'));
     } catch (e) {
       debugPrint('Could not play dialing sound: $e');
       // Fallback: Use system sound if asset not available
@@ -26,16 +30,23 @@ class SoundManager {
   /// Play ringing sound for incoming calls
   Future<void> playRingingSound() async {
     if (_isPlayingRingtone) return;
+
+    if (kIsWeb) {
+      _isPlayingRingtone = true;
+      await _playSystemRingingSound();
+      _isPlayingRingtone = false;
+      return;
+    }
     
     _isPlayingRingtone = true;
     try {
       // Use built-in system sound for ringing
-      await _audioPlayer.play(AssetSource('sounds/ringing.mp3'));
+      await _audioPlayer.play(AssetSource('assets/sounds/ringing.mp3'));
       
       // Loop the ringing sound
       _audioPlayer.onPlayerComplete.listen((_) {
         if (_isPlayingRingtone) {
-          _audioPlayer.play(AssetSource('sounds/ringing.mp3'));
+          _audioPlayer.play(AssetSource('assets/sounds/ringing.mp3'));
         }
       });
     } catch (e) {
@@ -53,8 +64,12 @@ class SoundManager {
 
   /// Play call connected sound
   Future<void> playCallConnectedSound() async {
+    if (kIsWeb) {
+      await _playSystemConnectedSound();
+      return;
+    }
     try {
-      await _audioPlayer.play(AssetSource('sounds/connected.mp3'));
+      await _audioPlayer.play(AssetSource('assets/sounds/connected.mp3'));
     } catch (e) {
       debugPrint('Could not play connected sound: $e');
       // Fallback: Use system sound if asset not available
@@ -64,8 +79,12 @@ class SoundManager {
 
   /// Play call ended sound
   Future<void> playCallEndedSound() async {
+    if (kIsWeb) {
+      await _playSystemEndedSound();
+      return;
+    }
     try {
-      await _audioPlayer.play(AssetSource('sounds/call_ended.mp3'));
+      await _audioPlayer.play(AssetSource('assets/sounds/call_ended.mp3'));
     } catch (e) {
       debugPrint('Could not play call ended sound: $e');
       // Fallback: Use system sound if asset not available

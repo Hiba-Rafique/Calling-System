@@ -7,6 +7,7 @@ require('dotenv').config();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { getPool } = require('./db');
+const admin = require('firebase-admin');
 
 const app = express();
 app.use(cors());
@@ -18,6 +19,121 @@ const io = new Server(server, {
 });
 
 let onlineUsers = {};
+
+async function upsertFcmToken(userId, token) {
+  const pool = getPool();
+  try {
+    await pool.execute(
+      `INSERT INTO user_fcm_tokens (user_id, fcm_token)
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE fcm_token = VALUES(fcm_token)`,
+      [Number(userId), String(token)]
+    );
+  } catch (e) {
+    if (e && e.code === 'ER_NO_SUCH_TABLE') {
+      await ensureUserFcmTokensTable();
+      await pool.execute(
+        `INSERT INTO user_fcm_tokens (user_id, fcm_token)
+         VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE fcm_token = VALUES(fcm_token)`,
+        [Number(userId), String(token)]
+      );
+      return;
+    }
+    throw e;
+  }
+}
+
+async function getFcmTokenByUserId(userId) {
+  const pool = getPool();
+  let rows;
+  try {
+    [rows] = await pool.execute(
+      'SELECT fcm_token FROM user_fcm_tokens WHERE user_id = ? LIMIT 1',
+      [Number(userId)]
+    );
+  } catch (e) {
+    if (e && e.code === 'ER_NO_SUCH_TABLE') {
+      await ensureUserFcmTokensTable();
+      [rows] = await pool.execute(
+        'SELECT fcm_token FROM user_fcm_tokens WHERE user_id = ? LIMIT 1',
+        [Number(userId)]
+      );
+    } else {
+      throw e;
+    }
+  }
+  if (!rows || rows.length === 0) return null;
+  const t = rows[0].fcm_token;
+  return t ? String(t) : null;
+}
+
+async function ensureUserFcmTokensTable() {
+  const pool = getPool();
+  await pool.execute(
+    `CREATE TABLE IF NOT EXISTS user_fcm_tokens (
+      user_id INT NOT NULL,
+      fcm_token VARCHAR(512) NOT NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id),
+      CONSTRAINT fk_user_fcm_tokens_user_id FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )`
+  );
+}
+
+// Best-effort ensure at startup (prevents first request from failing on missing table).
+ensureUserFcmTokensTable().catch((e) => {
+  console.error('Failed to ensure user_fcm_tokens table:', e);
+});
+
+let firebaseEnabled = false;
+try {
+  // Configure with either a path to a service account JSON file, or the JSON itself.
+  // - FIREBASE_SERVICE_ACCOUNT_PATH="/path/to/service-account.json"
+  // - FIREBASE_SERVICE_ACCOUNT_JSON='{...}'
+  const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+
+  if (serviceAccountPath) {
+    // eslint-disable-next-line import/no-dynamic-require, global-require
+    const serviceAccount = require(serviceAccountPath);
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    firebaseEnabled = true;
+  } else if (serviceAccountJson) {
+    const serviceAccount = JSON.parse(serviceAccountJson);
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    firebaseEnabled = true;
+  } else {
+    // If backend already sends FCM elsewhere, you can leave this disabled.
+    firebaseEnabled = false;
+  }
+} catch (e) {
+  console.error('Failed to initialize firebase-admin:', e);
+  firebaseEnabled = false;
+}
+
+console.log('FCM firebaseEnabled:', firebaseEnabled);
+
+async function sendFcmDataMessage(token, data) {
+  if (!firebaseEnabled) return false;
+  if (!token) return false;
+  try {
+    const messageId = await admin.messaging().send({
+      token,
+      android: {
+        priority: 'high',
+      },
+      data: Object.fromEntries(
+        Object.entries(data || {}).map(([k, v]) => [k, v == null ? '' : String(v)])
+      ),
+    });
+    console.log('FCM send ok messageId=', messageId, 'type=', data && data.type);
+    return true;
+  } catch (e) {
+    console.error('FCM send failed:', e);
+    return false;
+  }
+}
 
 // Users who are currently in a call (ringing/connecting/connected)
 const busyUsers = new Set();
@@ -36,6 +152,46 @@ const pendingRoomInvites = {};
 
 const MAX_ROOM_PARTICIPANTS = 7;
 
+// Pending 1:1 call offers for offline callees.
+// pendingCalls[calleeCallId] -> { from, signalData, roomId, createdAt, timeoutHandle }
+const pendingCalls = {};
+const PENDING_CALL_TIMEOUT_MS = 30000;
+
+function clearPendingCallFor(calleeCallId, status, notifyCaller) {
+  const pending = pendingCalls[calleeCallId];
+  if (!pending) return;
+
+  try {
+    clearTimeout(pending.timeoutHandle);
+  } catch (_) {}
+
+  const from = pending.from;
+  const to = calleeCallId;
+  const roomId = pending.roomId;
+
+  const callDbId = activeCallDbId[pairKey(from, to)];
+  delete activeCallDbId[pairKey(from, to)];
+  delete activeCallDbId[pairKey(to, from)];
+  finalizeCallLog(callDbId, status || 'missed');
+
+  if (roomId && rooms[roomId]) {
+    delete rooms[roomId];
+    delete roomMeta[roomId];
+  }
+
+  delete userRoom[from];
+  delete userRoom[to];
+
+  clearBusy(from);
+  clearBusy(to);
+
+  delete pendingCalls[calleeCallId];
+
+  if (notifyCaller && onlineUsers[from]) {
+    io.to(onlineUsers[from]).emit('callFailed', { from: to, reason: status || 'offline' });
+  }
+}
+
 // Track DB call_id for active (ringing/connected) calls, keyed by pair
 const activeCallDbId = {};
 
@@ -45,11 +201,18 @@ function pairKey(a, b) {
 
 async function resolveUserIdByCallId(callUserId) {
   if (!callUserId) return null;
+  const raw = String(callUserId).trim();
+
+  // Some clients may still send numeric internal user_id instead of call_user_id.
+  // Support both to avoid silently skipping FCM for offline calls.
+  if (/^\d+$/.test(raw)) {
+    return Number(raw);
+  }
   try {
     const pool = getPool();
     const [rows] = await pool.execute(
       'SELECT user_id FROM users WHERE call_user_id = ? LIMIT 1',
-      [String(callUserId).trim()]
+      [raw]
     );
     if (!rows || rows.length === 0) return null;
     return rows[0].user_id;
@@ -232,6 +395,37 @@ app.post('/api/auth/register', async (req, res) => {
       }
       throw err;
     }
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Register/update FCM token for the current user.
+// Data-only push requires the backend to know the device token.
+app.post('/api/push/fcm-token', authMiddleware, async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    const t = token ? String(token).trim() : '';
+    if (!t) {
+      return res.status(400).json({ error: 'token is required' });
+    }
+    await upsertFcmToken(req.user.user_id, t);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Debug helper to verify FCM is configured and whether the current user has a token.
+app.get('/api/push/status', authMiddleware, async (req, res) => {
+  try {
+    const t = await getFcmTokenByUserId(req.user.user_id);
+    return res.json({
+      firebaseEnabled,
+      hasToken: !!t,
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: 'Server error' });
@@ -557,15 +751,38 @@ app.post('/api/calls/end', authMiddleware, async (req, res) => {
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
+  let socketUserId = null;
+
   // Register user
   socket.on("register", (userId) => {
     console.log('Registering user:', userId, 'socket:', socket.id);
+    socketUserId = userId;
     // Only update if user not already online or if socket has changed
     if (!onlineUsers[userId] || onlineUsers[userId] !== socket.id) {
       onlineUsers[userId] = socket.id;
       console.log('Updated onlineUsers for:', userId);
     }
     console.log('Current online users:', Object.keys(onlineUsers));
+
+    // If this user had a pending 1:1 call while offline, deliver it now.
+    const pending = pendingCalls[userId];
+    if (pending && onlineUsers[userId]) {
+      try {
+        console.log('Delivering pending incomingCall to:', userId, 'roomId:', pending.roomId, 'from:', pending.from);
+        io.to(onlineUsers[userId]).emit('incomingCall', {
+          signal: pending.signalData,
+          from: pending.from,
+          roomId: pending.roomId,
+        });
+      } catch (e) {
+        console.error('Failed to deliver pending call:', e);
+      }
+
+      try {
+        clearTimeout(pending.timeoutHandle);
+      } catch (_) {}
+      delete pendingCalls[userId];
+    }
   });
 
   // Call someone
@@ -630,12 +847,106 @@ io.on("connection", (socket) => {
       console.log('Emitted incomingCall');
     } else {
       console.log('Callee NOT found online:', userToCall);
-      if (onlineUsers[from]) {
-        io.to(onlineUsers[from]).emit("callFailed", { from: userToCall, reason: 'offline' });
+
+      // Queue the call instead of failing immediately.
+      // Caller will continue ringing; callee will be woken by FCM and when they register,
+      // we deliver the pending offer via Socket.IO.
+
+      // If there is already a pending call to this callee, treat as busy.
+      if (pendingCalls[userToCall]) {
+        if (onlineUsers[from]) {
+          io.to(onlineUsers[from]).emit('callFailed', { from: userToCall, reason: 'busy' });
+        }
+        return;
       }
 
-      // Log as missed (offline)
-      createCallLog(from, userToCall).then((callDbId) => finalizeCallLog(callDbId, 'missed'));
+      // Mark busy pair to prevent other parallel calls while pending.
+      markBusyPair(from, userToCall);
+
+      // Create a room for this call so once callee comes online both sides share the same roomId.
+      const roomId = makeRoomId(from, userToCall);
+      rooms[roomId] = new Set([from, userToCall]);
+      roomMeta[roomId] = { isVideoCall: isVideoCallFromSignal(signalData) };
+      userRoom[from] = roomId;
+      userRoom[userToCall] = roomId;
+
+      // Create call log row and keep it active until timeout/cancel/end.
+      createCallLog(from, userToCall).then((callDbId) => {
+        if (!callDbId) return;
+        activeCallDbId[pairKey(from, userToCall)] = callDbId;
+        activeCallDbId[pairKey(userToCall, from)] = callDbId;
+      });
+
+      const timeoutHandle = setTimeout(() => {
+        const pending = pendingCalls[userToCall];
+        if (!pending) return;
+        console.log('Pending call timed out for offline callee:', userToCall);
+
+        const callDbId = activeCallDbId[pairKey(from, userToCall)];
+        delete activeCallDbId[pairKey(from, userToCall)];
+        delete activeCallDbId[pairKey(userToCall, from)];
+        finalizeCallLog(callDbId, 'missed');
+
+        // Clean up room and busy state.
+        const rid = pending.roomId;
+        if (rid && rooms[rid]) {
+          delete rooms[rid];
+          delete roomMeta[rid];
+        }
+        delete userRoom[from];
+        delete userRoom[userToCall];
+        clearBusy(from);
+        clearBusy(userToCall);
+
+        delete pendingCalls[userToCall];
+
+        if (onlineUsers[from]) {
+          io.to(onlineUsers[from]).emit('callFailed', { from: userToCall, reason: 'offline' });
+        }
+      }, PENDING_CALL_TIMEOUT_MS);
+
+      pendingCalls[userToCall] = {
+        from,
+        signalData,
+        roomId,
+        createdAt: Date.now(),
+        timeoutHandle,
+      };
+
+      // Send data-only FCM so Android can display a full-screen incoming call notification.
+      resolveUserIdByCallId(userToCall).then((calleeInternalId) => {
+        if (!calleeInternalId) {
+          console.log('[FCM][offline] could not resolve user_id for callee=', userToCall);
+          return;
+        }
+        return getFcmTokenByUserId(calleeInternalId)
+          .then((token) => {
+            if (!token) {
+              console.log('[FCM][offline] no token for user_id=', calleeInternalId, 'callee=', userToCall);
+              return false;
+            }
+            console.log('[FCM][offline] sending INCOMING_CALL to user_id=', calleeInternalId, 'callee=', userToCall);
+            return sendFcmDataMessage(token, {
+              type: 'INCOMING_CALL',
+              from,
+              to: userToCall,
+              roomId,
+              isVideoCall: roomMeta[roomId] && roomMeta[roomId].isVideoCall ? 'true' : 'false',
+            });
+          })
+          .then((ok) => {
+            if (ok) {
+              console.log('[FCM][offline] send result=ok callee=', userToCall);
+            } else {
+              console.log('[FCM][offline] send result=skipped/failed callee=', userToCall, 'firebaseEnabled=', firebaseEnabled);
+            }
+            return ok;
+          })
+          .catch((e) => {
+            console.error('[FCM][offline] error sending push callee=', userToCall, e);
+            return false;
+          });
+      });
     }
   });
 
@@ -653,6 +964,12 @@ io.on("connection", (socket) => {
 
   // Reject call
   socket.on("rejectCall", ({ to, from, reason }) => {
+    // If caller was offline-queued and callee rejects after coming online,
+    // ensure pending state is cleaned up.
+    if (from && pendingCalls[from] && pendingCalls[from].from === to) {
+      clearPendingCallFor(from, 'missed', false);
+    }
+
     const roomId = from ? userRoom[from] : null;
     if (roomId && rooms[roomId] && rooms[roomId].has(from)) {
       endRoom(roomId, from);
@@ -674,6 +991,12 @@ io.on("connection", (socket) => {
   // Caller cancels before callee answers
   socket.on('cancelCall', ({ to, from }) => {
     if (!to || !from) return;
+
+    // Caller cancels while callee is still offline and call is queued.
+    if (pendingCalls[to] && pendingCalls[to].from === from) {
+      clearPendingCallFor(to, 'missed', false);
+      return;
+    }
 
     const roomId = userRoom[from];
     if (roomId && rooms[roomId] && rooms[roomId].has(from)) {
@@ -697,6 +1020,12 @@ io.on("connection", (socket) => {
 
   // Call failed (timeout/ICE failure/etc)
   socket.on("callFailed", ({ to, from, reason }) => {
+    // If caller reports failure while callee is still offline queued, clean it up.
+    if (to && pendingCalls[to] && pendingCalls[to].from === from) {
+      clearPendingCallFor(to, 'missed', false);
+      return;
+    }
+
     const roomId = from ? userRoom[from] : null;
     if (roomId && rooms[roomId] && rooms[roomId].has(from)) {
       endRoom(roomId, from);
@@ -760,6 +1089,23 @@ io.on("connection", (socket) => {
       if (onlineUsers[from]) {
         io.to(onlineUsers[from]).emit('roomInviteFailed', { roomId, to, reason: 'offline' });
       }
+
+      // Invitee offline: send data-only push so they can open the app and see an incoming invite.
+      resolveUserIdByCallId(to).then((inviteeInternalId) => {
+        if (!inviteeInternalId) return;
+        getFcmTokenByUserId(inviteeInternalId)
+          .then((token) => {
+            if (!token) return;
+            return sendFcmDataMessage(token, {
+              type: 'INCOMING_CALL',
+              from,
+              roomId,
+              to,
+              isVideoCall: roomMeta[roomId] && roomMeta[roomId].isVideoCall ? 'true' : 'false',
+            });
+          })
+          .catch(() => {});
+      });
       return;
     }
 
@@ -845,31 +1191,43 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    for (let user in onlineUsers) {
-      if (onlineUsers[user] === socket.id) {
-        delete onlineUsers[user];
+    const user = socketUserId;
+    if (!user) return;
 
-        // If a user disconnects while in a room, notify the room and remove them.
-        const roomId = userRoom[user];
-        if (roomId) {
-          removeUserFromRoom(user);
-          broadcastRoom(roomId, 'roomParticipantLeft', { roomId, userId: user });
-        }
-
-        // If a user disappears while busy, clear their busy pair. Call will be marked missed
-        const other = activePeer[user];
-        const callDbId = other ? activeCallDbId[pairKey(user, other)] : null;
-        if (other) {
-          delete activeCallDbId[pairKey(user, other)];
-          delete activeCallDbId[pairKey(other, user)];
-        }
-        finalizeCallLog(callDbId, 'missed');
-        clearBusy(user);
-      }
+    if (onlineUsers[user] === socket.id) {
+      delete onlineUsers[user];
     }
+
+    // If a user disconnects while in a room, notify the room and remove them.
+    const roomId = userRoom[user];
+    if (roomId) {
+      removeUserFromRoom(user);
+      broadcastRoom(roomId, 'roomParticipantLeft', { roomId, userId: user });
+    }
+
+    // If a user had a queued pending call while offline (callee), clear it.
+    if (pendingCalls[user]) {
+      clearPendingCallFor(user, 'missed', false);
+    }
+
+    // If a user disappears while busy, clear their busy pair. Call will be marked missed
+    const other = activePeer[user];
+    const callDbId = other ? activeCallDbId[pairKey(user, other)] : null;
+    if (other) {
+      delete activeCallDbId[pairKey(user, other)];
+      delete activeCallDbId[pairKey(other, user)];
+    }
+    finalizeCallLog(callDbId, 'missed');
+    clearBusy(user);
   });
 
   socket.on("endCall", ({ to, from }) => {
+    // If callee is still offline queued, treat as cancel/end and clean up.
+    if (to && pendingCalls[to] && pendingCalls[to].from === from) {
+      clearPendingCallFor(to, 'completed', false);
+      return;
+    }
+
     // If the caller is in a room, end the call for all participants.
     const roomId = from ? userRoom[from] : null;
     if (roomId && rooms[roomId] && rooms[roomId].has(from)) {

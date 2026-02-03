@@ -124,6 +124,17 @@ class _CallingInterfaceState extends State<CallingInterface>
       }
     });
 
+    _callService.remoteStreamsStream.listen((streams) {
+      if (_isDisposed) return;
+      // For audio-only calls, ensure the first remote stream is attached to enable audio playback
+      if (!_callService.isVideoCall && streams.isNotEmpty) {
+        final firstRemoteStream = streams.values.first;
+        _remoteRenderer.srcObject = firstRemoteStream;
+        debugPrint('🔊 Attached first remote stream to renderer for audio-only call');
+      }
+      if (mounted) setState(() {});
+    });
+
     _callService.localStreamStream.listen((stream) {
       if (_isDisposed) return;
       _localRenderer.srcObject = stream;
@@ -703,6 +714,25 @@ class _CallingInterfaceState extends State<CallingInterface>
                   _remoteRenderer,
                   mirror: false,
                   objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                ),
+              )
+            else
+              // Audio-only calls still require attaching the remote stream to a media element
+              // (especially on web) to allow audio playback.
+              Positioned(
+                left: 0,
+                top: 0,
+                child: SizedBox(
+                  width: 1,
+                  height: 1,
+                  child: Opacity(
+                    opacity: 0.0,
+                    child: RTCVideoView(
+                      _remoteRenderer,
+                      mirror: false,
+                      objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                    ),
+                  ),
                 ),
               ),
 

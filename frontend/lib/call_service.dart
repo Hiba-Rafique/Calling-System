@@ -8,11 +8,12 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'sound_manager.dart';
 import 'web_unload.dart';
+import 'call_ringing_platform.dart';
 
 const String kSignalingServerUrl = 'https://rjsw7olwsc3y.share.zrok.io';
 
 /// CallService manages WebRTC connections and Socket.IO signaling for voice calls
-class CallService {
+class CallService with ChangeNotifier {
   static final CallService _instance = CallService._internal();
   factory CallService() => _instance;
   CallService._internal();
@@ -40,6 +41,10 @@ class CallService {
   Timer? _dialingTimer;
   Timer? _ringingTimer;
   Timer? _connectingTimer;
+  Timer? _webrtcDisconnectTimer;
+  bool _everConnected = false;
+
+  Map<String, dynamic>? _pendingAutoAccept;
   
   // Call state
   CallState _callState = CallState.idle;
@@ -97,6 +102,52 @@ class CallService {
   bool get isCameraOn => _isCameraOn;
   bool get isScreenSharing => _isScreenSharing;
 
+  Future<void> _applyInCallAudioRoute() async {
+    debugPrint('🔧 Applying in-call audio route...');
+    if (kIsWeb) {
+      debugPrint('🔧 Skipping audio route on web');
+      return;
+    }
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      debugPrint('🔧 Skipping audio route on non-Android');
+      return;
+    }
+    try {
+      final audioTracks = _localStream?.getAudioTracks() ?? [];
+      debugPrint('🔧 Local audio tracks count: ${audioTracks.length}');
+      if (audioTracks.isNotEmpty) {
+        await Helper.setMicrophoneMute(false, audioTracks.first);
+        audioTracks.first.enabled = true;
+        debugPrint('🔧 Mic unmuted and enabled');
+      } else {
+        debugPrint('🔧 No local audio tracks found');
+      }
+    } catch (e) {
+      debugPrint('🔧 In-call mic route setup failed: $e');
+    }
+
+    try {
+      await setSpeakerOn(true);
+      debugPrint('🔧 Speaker forced ON');
+    } catch (e) {
+      debugPrint('🔧 In-call speaker route setup failed: $e');
+    }
+  }
+
+  void armAutoAccept(Map<String, dynamic> payload) {
+    _pendingAutoAccept = Map<String, dynamic>.from(payload);
+  }
+
+  bool _matchesPendingAutoAccept(String from, String? roomId) {
+    final p = _pendingAutoAccept;
+    if (p == null) return false;
+    final pf = p['from']?.toString();
+    final pr = p['roomId']?.toString();
+    if (pf != null && pf.isNotEmpty && pf != from) return false;
+    if (pr != null && pr.isNotEmpty && roomId != null && roomId.isNotEmpty && pr != roomId) return false;
+    return true;
+  }
+
   void _cancelCallTimers() {
     _dialingTimer?.cancel();
     _dialingTimer = null;
@@ -104,6 +155,22 @@ class CallService {
     _ringingTimer = null;
     _connectingTimer?.cancel();
     _connectingTimer = null;
+    _webrtcDisconnectTimer?.cancel();
+    _webrtcDisconnectTimer = null;
+  }
+
+  void _markEverConnected() {
+    if (_everConnected) return;
+    _everConnected = true;
+  }
+
+  void _scheduleDisconnectFailure(String reason) {
+    _webrtcDisconnectTimer?.cancel();
+    _webrtcDisconnectTimer = Timer(const Duration(seconds: 5), () {
+      if (_callState == CallState.idle) return;
+      if (!_everConnected) return;
+      _failCall(reason);
+    });
   }
 
   void _failCall(String reason, {bool notifyRemote = true}) {
@@ -122,6 +189,7 @@ class CallService {
     }
 
     SoundManager().playCallEndedSound();
+    CallRingingPlatform.stopRinging();
     _endCall();
   }
 
@@ -554,6 +622,23 @@ class CallService {
         'roomId': _roomId,
       });
 
+      // If user tapped ACCEPT on the full-screen incoming call notification,
+      // auto-answer as soon as the offer is delivered via Socket.IO.
+      final from = data is Map ? data['from']?.toString() : null;
+      if (from != null && _matchesPendingAutoAccept(from, _roomId)) {
+        final offer = Map<String, dynamic>.from(rawOffer);
+        final callId = _callId ?? (_roomId ?? '${from}_$_currentUserId');
+        _pendingAutoAccept = null;
+        Future<void>(() async {
+          try {
+            await acceptCall(from, offer, callId);
+            await CallRingingPlatform.stopRinging();
+          } catch (e) {
+            debugPrint('Auto-accept failed: $e');
+          }
+        });
+      }
+
       _ringingTimer?.cancel();
       _ringingTimer = Timer(const Duration(seconds: 30), () {
         if (_callState == CallState.ringing) {
@@ -766,6 +851,7 @@ class CallService {
 
       SoundManager().stopRingingSound();
       _lastError = 'Call canceled';
+      CallRingingPlatform.stopRinging();
       _endCall();
     });
     
@@ -773,6 +859,7 @@ class CallService {
     _socket!.on('callRejected', (data) {
       debugPrint('Call rejected by: ${data['from']}');
       SoundManager().playCallEndedSound();
+      CallRingingPlatform.stopRinging();
       _endCall();
     });
 
@@ -796,6 +883,7 @@ class CallService {
       }
 
       SoundManager().playCallEndedSound();
+      CallRingingPlatform.stopRinging();
       _endCall();
     });
     
@@ -873,7 +961,7 @@ class CallService {
       
       // Set up peer connection event handlers
       _peerConnection!.onIceCandidate = (RTCIceCandidate candidate) {
-        debugPrint('ICE candidate generated');
+        debugPrint('🔧 ICE candidate generated');
         _sendIceCandidate(candidate);
       };
 
@@ -884,16 +972,25 @@ class CallService {
             (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
                 state == RTCIceConnectionState.RTCIceConnectionStateCompleted)) {
           debugPrint('ICE connected - updating call state to connected');
+          _markEverConnected();
           _updateCallState(CallState.connected);
           SoundManager().playCallConnectedSound();
         }
 
         if (_callState != CallState.idle &&
-            (state == RTCIceConnectionState.RTCIceConnectionStateFailed ||
-                state == RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
+            state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+          debugPrint('ICE connection failed with state: $state - failing call');
+          _failCall('ice_failed');
+          return;
+        }
+
+        // Disconnected/closed can be transient (especially on web) while dialing/connecting.
+        // Only fail if we were previously connected.
+        if (_callState != CallState.idle &&
+            (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
                 state == RTCIceConnectionState.RTCIceConnectionStateClosed)) {
-          debugPrint('ICE connection failed/ended with state: $state - failing call');
-          _failCall('ice_$state');
+          debugPrint('ICE connection state=$state; scheduling failure only if previously connected');
+          _scheduleDisconnectFailure('ice_$state');
         }
       };
 
@@ -903,20 +1000,27 @@ class CallService {
         if ((_callState == CallState.connecting || _callState == CallState.dialing) &&
             state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
           debugPrint('Peer connection connected - updating call state to connected');
+          _markEverConnected();
           _updateCallState(CallState.connected);
           SoundManager().playCallConnectedSound();
         }
 
         if (_callState != CallState.idle &&
-            (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
-                state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected ||
+            state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+          _failCall('pc_failed');
+          return;
+        }
+
+        if (_callState != CallState.idle &&
+            (state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected ||
                 state == RTCPeerConnectionState.RTCPeerConnectionStateClosed)) {
-          _failCall('pc_$state');
+          debugPrint('Peer connection state=$state; scheduling failure only if previously connected');
+          _scheduleDisconnectFailure('pc_$state');
         }
       };
       
       _peerConnection!.onTrack = (RTCTrackEvent event) {
-        debugPrint('Remote track added - stream count: ${event.streams.length}');
+        debugPrint('🔧 Remote track added - stream count: ${event.streams.length}');
         if (event.streams.isNotEmpty) {
           _remoteStream = event.streams[0];
           _remoteStreamController.add(_remoteStream);
@@ -924,9 +1028,10 @@ class CallService {
               .getTracks()
               .map((t) => '${t.kind}(enabled=${t.enabled})')
               .toList();
-          debugPrint('Remote tracks: $remoteTrackInfo');
+          debugPrint('🔧 Remote tracks: $remoteTrackInfo');
           if (_callState == CallState.connecting) {
-            debugPrint('Remote track added while connecting - updating to connected');
+            debugPrint('🔧 Remote track added while connecting - updating to connected');
+            _markEverConnected();
             _updateCallState(CallState.connected);
             SoundManager().playCallConnectedSound();
           }
@@ -988,7 +1093,7 @@ class CallService {
           .map((t) => '${t.kind}(enabled=${t.enabled})')
           .toList();
       debugPrint('Local tracks: $localTrackInfo');
-      debugPrint('WebRTC initialized successfully');
+      debugPrint('🔧 WebRTC initialized. enableVideo=$enableVideo, local audio tracks: ${_localStream?.getAudioTracks().length ?? 0}');
     } catch (e) {
       debugPrint('Failed to initialize WebRTC: $e');
       rethrow;
@@ -1132,6 +1237,8 @@ class CallService {
         'from': _currentUserId,
         'roomId': _roomId,
       });
+
+      CallRingingPlatform.stopRinging();
 
       if (!kIsWeb) {
         try {
@@ -1550,6 +1657,12 @@ class CallService {
   void _updateCallState(CallState newState) {
     final previousState = _callState;
     _callState = newState;
+
+    if (newState == CallState.connected && previousState != CallState.connected) {
+      Future<void>(() async {
+        await _applyInCallAudioRoute();
+      });
+    }
 
     if (previousState != CallState.connected && newState == CallState.connected) {
       _cancelCallTimers();

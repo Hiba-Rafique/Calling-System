@@ -217,4 +217,32 @@ class AuthService {
 
     return body;
   }
+
+  Future<void> registerFcmToken({
+    required String baseUrl,
+    required String authToken,
+    required String fcmToken,
+  }) async {
+    final t = fcmToken.trim();
+    if (t.isEmpty) {
+      throw Exception('FCM token is empty');
+    }
+
+    final res = await _withFallback(
+      (url) => http.post(
+        _uri(url, '/api/push/fcm-token'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $authToken',
+        },
+        body: jsonEncode({'token': t}),
+      ),
+      primaryBaseUrl: baseUrl,
+    );
+
+    final Map<String, dynamic> body = _tryDecodeJsonObject(res);
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw Exception(body['error'] ?? 'Failed to register FCM token');
+    }
+  }
 }

@@ -1,23 +1,374 @@
+import 'dart:ui';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'callkit_bridge.dart';
 import 'auth_screen.dart';
 import 'auth_service.dart';
 import 'call_screen.dart';
 import 'call_service.dart';
 import 'background_call_service.dart';
 import 'set_call_id_screen.dart';
+import 'pending_call_accept.dart';
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
+const String _incomingCallChannelId = 'incoming_calls';
+const String _incomingCallChannelName = 'Incoming calls';
+
+final FlutterLocalNotificationsPlugin _localNotifications =
+    FlutterLocalNotificationsPlugin();
+
+Future<void> _initializeLocalNotifications() async {
+  const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+  const initSettings = InitializationSettings(android: androidInit);
+
+  await _localNotifications.initialize(
+    initSettings,
+    onDidReceiveNotificationResponse: (NotificationResponse response) {
+      debugPrint('[LOCAL_NOTIF] actionId=${response.actionId} payload=${response.payload}');
+      // TODO: Wire these actions into your real call accept/decline flow.
+      // For data-only pushes, the backend should include enough info in payload
+      // (roomId/callerId/etc.) so you can start signaling when user accepts.
+      if (response.actionId == 'ACCEPT_CALL') {
+        debugPrint('[CALL_UI] Accept tapped');
+      } else if (response.actionId == 'DECLINE_CALL') {
+        debugPrint('[CALL_UI] Decline tapped');
+      } else {
+        debugPrint('[CALL_UI] Notification tapped');
+      }
+    },
+  );
+
+  final android = _localNotifications
+      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+  if (android != null) {
+    await android.createNotificationChannel(
+      const AndroidNotificationChannel(
+        _incomingCallChannelId,
+        _incomingCallChannelName,
+        description: 'Full-screen incoming call alerts',
+        importance: Importance.max,
+      ),
+    );
+  }
+}
+
+/// IMPORTANT: Top-level FCM background handler.
+///
+/// - Must be a top-level function (not inside a class).
+/// - Must be annotated as an entry-point so it can run in a background isolate.
+/// - Handles **data-only** messages when the app is in background/killed.
+@pragma('vm:entry-point')
+Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  // Required so plugins (e.g. local notifications) can be used in the background isolate.
+  DartPluginRegistrant.ensureInitialized();
+  await Firebase.initializeApp();
+
+  debugPrint('[FCM][background] messageId=${message.messageId} data=${message.data}');
+
+  final type = message.data['type']?.toString();
+  if (type == 'INCOMING_CALL') {
+    showIncomingCallUI(message.data);
+  }
+}
+
+/// Placeholder for WhatsApp-style incoming call UI.
+///
+/// For Android reliability, this should eventually be backed by a full-screen
+/// notification + a foreground service (or native ConnectionService) to wake and
+/// present UI even under Doze/background restrictions.
+void showIncomingCallUI(Map<String, dynamic> data) {
+  debugPrint('[CALL_UI] showIncomingCallUI payload=$data');
+
+  // Production-grade incoming call UI on Android:
+  // Use CallKit-style UX (full-screen call notification + lock-screen UI).
+  // This is triggered from:
+  // - foreground FCM
+  // - background FCM (top-level handler)
+  // - killed-state initial message
+  _showCallkitIncoming(data);
+}
+
+Future<void> _showCallkitIncoming(Map<String, dynamic> data) async {
+  if (kIsWeb) return;
+  try {
+    final callId = (data['callId'] ?? data['call_id'] ?? data['roomId'] ?? '').toString();
+    if (callId.isEmpty) {
+      debugPrint('[CALLKIT] missing callId in payload; not showing UI');
+      return;
+    }
+
+    final callerName = (data['callerName'] ?? data['from'] ?? 'Unknown').toString();
+    final callType = (data['callType'] ?? (data['isVideoCall'] == 'true' ? 'video' : 'audio')).toString();
+
+    final params = <String, dynamic>{
+      'id': callId,
+      'nameCaller': callerName,
+      'appName': 'Calling System',
+      'avatar': '',
+      'handle': callerName,
+      'type': (callType.toLowerCase().contains('video')) ? 1 : 0,
+      'duration': 30000,
+      'textAccept': 'Accept',
+      'textDecline': 'Decline',
+      'extra': {
+        // Preserve the original payload so Accept can proceed to call setup.
+        ...data,
+      },
+      'android': {
+        'isCustomNotification': true,
+        'isShowLogo': false,
+        'isShowCallback': false,
+        'isShowMissedCallNotification': true,
+        'ringtonePath': 'system_ringtone_default',
+        'backgroundColor': '#095E54',
+        'actionColor': '#4CAF50',
+        'incomingCallNotificationChannelName': 'Incoming Calls',
+      },
+    };
+
+    await CallkitBridge.showIncoming(params);
+    debugPrint('[CALLKIT] showCallkitIncoming shown for callId=$callId');
+  } catch (e) {
+    debugPrint('[CALLKIT] failed to show incoming UI: $e');
+    // Fallback to local notification if CallKit fails for any reason.
+    _showIncomingCallNotification(data);
+  }
+}
+
+Future<void> _endCallkit(String callId) async {
+  try {
+    await CallkitBridge.endCall(callId);
+  } catch (_) {}
+}
+
+void _setupCallkitEventHandlers() {
+  if (kIsWeb) return;
+
+  CallkitBridge.onEvent.listen((event) async {
+    final dynamic eventName = (event is Map) ? event['event'] : (event?.event);
+    final dynamic body = (event is Map) ? event['body'] : (event?.body);
+    debugPrint('[CALLKIT] event=$eventName body=$body');
+
+    final callId = body is Map ? (body['id'] ?? body['callId'] ?? body['uuid'])?.toString() : null;
+
+    final e = eventName?.toString();
+    if (e == 'ACTION_CALL_ACCEPT' || e == 'ACTION_CALL_ACCEPTED' || e == 'accept') {
+      // Hard requirement:
+      // - Launch app
+      // - Start a foreground service
+      // - Proceed to call setup (placeholder)
+      // NOTE: do NOT attempt to open UI directly from background without a notification.
+
+      // Placeholder: show an active call notification (foreground-like) using existing service.
+      // Your real implementation should start an Android foreground service that maintains
+      // call state and audio routing.
+      try {
+        await BackgroundCallService().showCallConnectedNotification(
+          (body is Map ? (body['nameCaller']?.toString() ?? 'Unknown') : 'Unknown'),
+        );
+      } catch (_) {}
+
+      debugPrint('[CALLKIT] ACCEPT: proceed to call setup (placeholder)');
+    }
+
+    if (e == 'ACTION_CALL_DECLINE' || e == 'ACTION_CALL_DECLINED' || e == 'decline') {
+      if (callId != null) {
+        await _endCallkit(callId);
+      }
+      debugPrint('[CALLKIT] DECLINE: notify backend (placeholder)');
+      // TODO: call your backend endpoint to decline the call (requires auth + callId)
+      // e.g. POST /api/calls/decline { callId }
+    }
+
+    if (e == 'ACTION_CALL_ENDED' || e == 'ACTION_CALL_TIMEOUT' || e == 'ended' || e == 'timeout') {
+      // Cleanup any foreground notification.
+      try {
+        await BackgroundCallService().clearNotifications();
+      } catch (_) {}
+    }
+  });
+}
+
+Future<void> _showIncomingCallNotification(Map<String, dynamic> data) async {
+  try {
+    await _initializeLocalNotifications();
+
+    final callerName = (data['callerName'] ?? data['from'] ?? 'Unknown').toString();
+    final isVideo = (data['isVideoCall']?.toString().toLowerCase() == 'true');
+    final title = isVideo ? 'Incoming video call' : 'Incoming voice call';
+    final body = callerName;
+
+    const androidDetails = AndroidNotificationDetails(
+      _incomingCallChannelId,
+      _incomingCallChannelName,
+      channelDescription: 'Full-screen incoming call alerts',
+      importance: Importance.max,
+      priority: Priority.high,
+      category: AndroidNotificationCategory.call,
+      fullScreenIntent: true,
+      visibility: NotificationVisibility.public,
+      ticker: 'Incoming call',
+      ongoing: true,
+      autoCancel: false,
+      actions: <AndroidNotificationAction>[
+        AndroidNotificationAction('ACCEPT_CALL', 'Accept', showsUserInterface: true),
+        AndroidNotificationAction('DECLINE_CALL', 'Decline', cancelNotification: true),
+      ],
+    );
+
+    const details = NotificationDetails(android: androidDetails);
+
+    // Use a stable ID for “one active incoming call”.
+    await _localNotifications.show(
+      9991,
+      title,
+      body,
+      details,
+      payload: data.toString(),
+    );
+  } catch (e) {
+    debugPrint('[LOCAL_NOTIF] failed to show incoming call notification: $e');
+  }
+}
+
+/// Exposes the current device FCM token.
+Future<String?> getFcmDeviceToken() {
+  return FirebaseMessaging.instance.getToken();
+}
+
+/// Stub hook: send the FCM token to your backend.
+///
+/// Call this after login, and also on `FirebaseMessaging.instance.onTokenRefresh`.
+Future<void> sendFcmTokenToBackend(String token) async {
+  debugPrint('[FCM] send token to backend: $token');
+
+  // We need the user's JWT to associate this device token to the authenticated user.
+  // This uses the existing AuthService storage.
+  try {
+    final auth = AuthService();
+    final jwt = await auth.getToken();
+    if (jwt == null || jwt.isEmpty) {
+      debugPrint('[FCM] no auth token yet; skipping backend token registration');
+      return;
+    }
+
+    await auth.registerFcmToken(
+      baseUrl: _AppNavigatorState._primaryBaseUrl,
+      authToken: jwt,
+      fcmToken: token,
+    );
+    debugPrint('[FCM] token registered with backend');
+  } catch (e) {
+    debugPrint('[FCM] failed to register token with backend: $e');
+  }
+}
+
+Future<void> _initializeFcm() async {
+  // Request notification permission (Android 13+).
+  // Even for data-only pushes, you typically want permission so you can show
+  // a local full-screen/heads-up incoming call notification.
+  final settings = await FirebaseMessaging.instance.requestPermission(
+    alert: true,
+    badge: true,
+    sound: true,
+  );
+  debugPrint('[FCM] permission status=${settings.authorizationStatus}');
+
+  // Get and register the token (send to backend).
+  final token = await FirebaseMessaging.instance.getToken();
+  debugPrint('[FCM] token=$token');
+  if (token != null && token.isNotEmpty) {
+    await sendFcmTokenToBackend(token);
+  }
+
+  // Token refresh must be handled to keep backend mapping valid.
+  FirebaseMessaging.instance.onTokenRefresh.listen((t) async {
+    debugPrint('[FCM] token refreshed=$t');
+    if (t.isNotEmpty) {
+      await sendFcmTokenToBackend(t);
+    }
+  });
+
+  // Foreground: app visible.
+  FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+    debugPrint('[FCM][foreground] messageId=${message.messageId} data=${message.data}');
+    final type = message.data['type']?.toString();
+    if (type == 'INCOMING_CALL') {
+      showIncomingCallUI(message.data);
+    }
+  });
+
+  // Background (app in background) and user taps notification.
+  // NOTE: For data-only pushes there may be no notification to tap, but we
+  // still keep this for completeness if you show a local notification.
+  FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+    debugPrint('[FCM][opened] messageId=${message.messageId} data=${message.data}');
+    final type = message.data['type']?.toString();
+    if (type == 'INCOMING_CALL') {
+      showIncomingCallUI(message.data);
+    }
+  });
+
+  // Killed-state: app launched from a terminated state due to a message.
+  final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
+  if (initialMessage != null) {
+    debugPrint('[FCM][initial] messageId=${initialMessage.messageId} data=${initialMessage.data}');
+    final type = initialMessage.data['type']?.toString();
+    if (type == 'INCOMING_CALL') {
+      showIncomingCallUI(initialMessage.data);
+    }
+  }
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Android-only: initialize Firebase/FCM.
+  // Web was blank because firebase_core_web requires web Firebase config.
+  // Since your requirement is Android only, we skip Firebase init on web.
+  if (!kIsWeb) {
+    // Firebase must be initialized before using Firebase Messaging.
+    await Firebase.initializeApp();
+
+    // Register background handler before `runApp`.
+    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+  }
 
   await Hive.initFlutter();
   await Hive.openBox<dynamic>('auth');
 
   if (!kIsWeb) {
+    try {
+      final pending = await PendingCallAccept.consume();
+      if (pending != null) {
+        CallService().armAutoAccept(pending);
+      }
+    } catch (_) {}
+  }
+
+  if (!kIsWeb) {
     await BackgroundCallService().initialize();
+  }
+
+  // Initialize local notifications early so full-screen intents are ready.
+  if (!kIsWeb) {
+    await _initializeLocalNotifications();
+  }
+
+  // Initialize FCM after Firebase initialization.
+  if (!kIsWeb) {
+    await _initializeFcm();
+  }
+
+  // Must be set up after plugins are registered.
+  if (!kIsWeb) {
+    _setupCallkitEventHandlers();
   }
   
   runApp(const CallingSystemApp());
@@ -138,6 +489,19 @@ class _AppNavigatorState extends State<AppNavigator> {
     final userId = me['user_id'];
     if (userId is! int) {
       throw Exception('Invalid user_id from server');
+    }
+
+    // Now that we have a valid auth session, register the device's FCM token
+    // with the backend (FCM init may have happened before login).
+    if (!kIsWeb) {
+      try {
+        final t = await getFcmDeviceToken();
+        if (t != null && t.isNotEmpty) {
+          await sendFcmTokenToBackend(t);
+        }
+      } catch (e) {
+        debugPrint('[FCM] post-login token registration failed: $e');
+      }
     }
 
     final callId = await _ensureCallUserId(me);

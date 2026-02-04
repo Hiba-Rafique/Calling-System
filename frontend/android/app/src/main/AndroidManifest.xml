@@ -13,6 +13,13 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Additional permissions for background execution -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- Permission for app state monitoring -->
+    <uses-permission android:name="android.permission.GET_TASKS" />
 
     <application
         android:label="Calling System"
@@ -26,7 +33,8 @@
 
         <service
             android:name="com.example.frontend.IncomingCallFirebaseService"
-            android:exported="false">
+            android:exported="false"
+            android:directBootAware="true">
             <intent-filter>
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>
@@ -45,11 +53,49 @@
         <service
             android:name="com.example.frontend.CallRingingForegroundService"
             android:exported="false"
-            android:foregroundServiceType="phoneCall" />
+            android:foregroundServiceType="phoneCall"
+            android:directBootAware="true" />
+
+        <service
+            android:name="com.example.frontend.BackgroundKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync|specialUse" />
+
+        <service
+            android:name="com.example.frontend.AppStateMonitorService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <receiver
             android:name="com.example.frontend.IncomingCallActionReceiver"
             android:exported="false" />
+
+        <!-- Service heartbeat receiver -->
+        <receiver
+            android:name="com.example.frontend.ServiceHeartbeatReceiver"
+            android:exported="false" />
+
+        <!-- Force disconnect receiver -->
+        <receiver
+            android:name="com.example.frontend.ForceDisconnectReceiver"
+            android:exported="false" />
+
+        <!-- Wake up receiver to ensure device wakes for incoming calls -->
+        <receiver
+            android:name="com.example.frontend.WakeUpReceiver"
+            android:exported="false" />
+
+        <!-- Boot receiver to restart services on device restart -->
+        <receiver
+            android:name="com.example.frontend.BootReceiver"
+            android:exported="true">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.PACKAGE_REPLACED" />
+                <data android:scheme="package" />
+            </intent-filter>
+        </receiver>
 
         <activity
             android:name=".MainActivity"

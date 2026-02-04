@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
 import androidx.core.app.NotificationCompat
 
 class CallRingingForegroundService : Service() {
@@ -23,18 +24,43 @@ class CallRingingForegroundService : Service() {
     const val EXTRA_ROOM_ID = "room_id"
     const val EXTRA_IS_VIDEO = "is_video"
 
-    const val ACTION_START = "com.example.frontend.ACTION_START_CALL_RINGING"
-    const val ACTION_STOP = "com.example.frontend.ACTION_STOP_CALL_RINGING"
+    const val ACTION_START = "START_RINGING"
+    const val ACTION_STOP = "STOP_RINGING"
   }
 
-  private val mainHandler = Handler(Looper.getMainLooper())
   private var timeoutRunnable: Runnable? = null
+  private val mainHandler = Handler(Looper.getMainLooper())
 
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    Log.d("RINGING", "🔔 CallRingingForegroundService started")
+    
     val action = intent?.action
+    Log.d("RINGING", "🔔 Action: $action")
+    
+    // Handle backup keep-alive action
+    if (action == "KEEP_ALIVE_BACKUP") {
+        Log.d("RINGING", "🔔 Started as backup keep-alive service")
+        ensureChannel()
+        val notification = createKeepAliveNotification()
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIF_ID + 1000, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(NOTIF_ID + 1000, notification)
+        }
+        
+        // Stop this backup service after 30 seconds
+        Handler(Looper.getMainLooper()).postDelayed({
+            Log.d("RINGING", "🔧 Stopping backup keep-alive service")
+            stopSelf()
+        }, 30000)
+        
+        return START_NOT_STICKY
+    }
+    
     if (action == ACTION_STOP) {
+      Log.d("RINGING", "🔔 Stopping ringing service")
       stopSelf()
       return START_NOT_STICKY
     }
@@ -45,6 +71,8 @@ class CallRingingForegroundService : Service() {
     val from = intent?.getStringExtra(EXTRA_FROM) ?: "Unknown"
     val roomId = intent?.getStringExtra(EXTRA_ROOM_ID) ?: ""
     val isVideo = intent?.getBooleanExtra(EXTRA_IS_VIDEO, false) ?: false
+
+    Log.d("RINGING", "🔔 Call details - ID: $callId, From: $from, Room: $roomId, Video: $isVideo")
 
     val notification = buildIncomingCallNotification(callId, from, roomId, isVideo)
 
@@ -58,12 +86,15 @@ class CallRingingForegroundService : Service() {
       startForeground(NOTIF_ID, notification)
     }
 
+    Log.d("RINGING", "🔔 Foreground service started with notification")
+
     scheduleTimeout()
 
-    return START_NOT_STICKY
+    return START_STICKY
   }
 
   override fun onDestroy() {
+    Log.d("RINGING", "🔔 CallRingingForegroundService destroyed")
     timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
     timeoutRunnable = null
     super.onDestroy()
@@ -79,18 +110,24 @@ class CallRingingForegroundService : Service() {
   }
 
   private fun ensureChannel() {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-    val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-    val existing = manager.getNotificationChannel(CHANNEL_ID)
-    if (existing != null) return
-
-    val channel = NotificationChannel(
-      CHANNEL_ID,
-      "Incoming calls",
-      NotificationManager.IMPORTANCE_HIGH
-    )
-    channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-    manager.createNotificationChannel(channel)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      val channel = NotificationChannel(
+        CHANNEL_ID,
+        "Incoming Calls",
+        NotificationManager.IMPORTANCE_HIGH
+      ).apply {
+        description = "Notifications for incoming calls"
+        enableLights(true)
+        enableVibration(true)
+        vibrationPattern = longArrayOf(0, 1000, 500, 1000)
+        setShowBadge(true)
+        lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        // Ensure vibration is enabled
+        setVibrationEnabled(true)
+      }
+      val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+      manager.createNotificationChannel(channel)
+    }
   }
 
   private fun buildIncomingCallNotification(
@@ -99,68 +136,91 @@ class CallRingingForegroundService : Service() {
     roomId: String,
     isVideo: Boolean
   ): Notification {
-    val acceptIntent = Intent(this, IncomingCallActionReceiver::class.java).apply {
-      action = IncomingCallActionReceiver.ACTION_ACCEPT
-      putExtra(EXTRA_CALL_ID, callId)
-      putExtra(EXTRA_FROM, from)
-      putExtra(EXTRA_ROOM_ID, roomId)
-      putExtra(EXTRA_IS_VIDEO, isVideo)
-    }
-
-    val declineIntent = Intent(this, IncomingCallActionReceiver::class.java).apply {
-      action = IncomingCallActionReceiver.ACTION_DECLINE
-      putExtra(EXTRA_CALL_ID, callId)
-      putExtra(EXTRA_FROM, from)
-      putExtra(EXTRA_ROOM_ID, roomId)
-      putExtra(EXTRA_IS_VIDEO, isVideo)
-    }
-
-    val acceptPending = PendingIntent.getBroadcast(
-      this,
-      3001,
-      acceptIntent,
-      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-    )
-
-    val declinePending = PendingIntent.getBroadcast(
-      this,
-      3002,
-      declineIntent,
-      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-    )
-
-    // Full-screen intent: launched ONLY after user interaction OR when the system decides it's allowed.
-    // We still provide it so the notification can show as a call-style full-screen UI.
-    val launchIntent = Intent(this, MainActivity::class.java).apply {
-      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-      action = IncomingCallActionReceiver.ACTION_OPEN_FROM_NOTIFICATION
-      putExtra(EXTRA_CALL_ID, callId)
-      putExtra(EXTRA_FROM, from)
-      putExtra(EXTRA_ROOM_ID, roomId)
-      putExtra(EXTRA_IS_VIDEO, isVideo)
-    }
-
+    val title = from // Just show the caller's name like WhatsApp
+    val content = if (isVideo) "Incoming video call" else "Incoming voice call"
+    
+    // Create intent to open app with full call screen
+    val fullScreenIntent = Intent(this, MainActivity::class.java)
+    fullScreenIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+    fullScreenIntent.putExtra("callId", callId)
+    fullScreenIntent.putExtra("from", from)
+    fullScreenIntent.putExtra("roomId", roomId)
+    fullScreenIntent.putExtra("isVideo", isVideo)
+    fullScreenIntent.putExtra("incomingCall", true)
+    fullScreenIntent.putExtra("showCallScreen", true) // Add flag to show full call screen
+    fullScreenIntent.action = "ANSWER_CALL"
+    
     val fullScreenPending = PendingIntent.getActivity(
-      this,
-      3003,
-      launchIntent,
+      this, 0, fullScreenIntent,
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     )
-
-    val title = if (isVideo) "Incoming video call" else "Incoming voice call"
+    
+    // Accept intent - same as full screen intent but with autoAnswer
+    val acceptIntent = Intent(this, MainActivity::class.java)
+    acceptIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+    acceptIntent.putExtra("callId", callId)
+    acceptIntent.putExtra("from", from)
+    acceptIntent.putExtra("roomId", roomId)
+    acceptIntent.putExtra("isVideo", isVideo)
+    acceptIntent.putExtra("incomingCall", true)
+    acceptIntent.putExtra("showCallScreen", true) // Add flag to show full call screen
+    acceptIntent.putExtra("autoAnswer", true) // Auto-accept when Answer button is tapped
+    acceptIntent.action = "ANSWER_CALL"
+    
+    val acceptPending = PendingIntent.getActivity(
+      this, 1, acceptIntent,
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+    
+    // Decline intent
+    val declineIntent = Intent(this, IncomingCallActionReceiver::class.java)
+    declineIntent.putExtra("callId", callId)
+    declineIntent.putExtra("from", from)
+    declineIntent.putExtra("roomId", roomId)
+    declineIntent.putExtra("isVideo", isVideo)
+    declineIntent.action = "DECLINE_CALL"
+    
+    val declinePending = PendingIntent.getBroadcast(
+      this, 2, declineIntent,
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
 
     return NotificationCompat.Builder(this, CHANNEL_ID)
-      .setSmallIcon(android.R.drawable.sym_call_incoming)
+      .setSmallIcon(android.R.drawable.stat_notify_phone)
       .setContentTitle(title)
-      .setContentText(from)
+      .setContentText(content)
       .setCategory(NotificationCompat.CATEGORY_CALL)
       .setPriority(NotificationCompat.PRIORITY_MAX)
       .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
       .setOngoing(true)
       .setAutoCancel(false)
+      .setDefaults(NotificationCompat.DEFAULT_SOUND or NotificationCompat.DEFAULT_LIGHTS) // Sound and lights
+      .setVibrate(longArrayOf(0, 1000, 500, 1000)) // Explicit vibration pattern
       .setFullScreenIntent(fullScreenPending, true)
-      .addAction(0, "Decline", declinePending)
-      .addAction(0, "Accept", acceptPending)
+      .setContentIntent(fullScreenPending) // Open app when notification is tapped
+      .setColorized(true)
+      .setColor(0xFF4CAF50) // WhatsApp green color
+      .addAction(
+        android.R.drawable.ic_menu_close_clear_cancel,
+        "Decline",
+        declinePending
+      )
+      .addAction(
+        android.R.drawable.ic_menu_call,
+        "Answer",
+        acceptPending
+      )
+      .build()
+  }
+  
+  private fun createKeepAliveNotification(): Notification {
+    return NotificationCompat.Builder(this, CHANNEL_ID)
+      .setContentTitle("Service Active")
+      .setContentText("Keeping calling service alive")
+      .setSmallIcon(R.mipmap.ic_launcher)
+      .setPriority(NotificationCompat.PRIORITY_LOW)
+      .setOngoing(true)
+      .setSilent(true)
       .build()
   }
 }

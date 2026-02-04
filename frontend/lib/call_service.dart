@@ -9,6 +9,7 @@ import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'sound_manager.dart';
 import 'web_unload.dart';
 import 'call_ringing_platform.dart';
+import 'socket_heartbeat.dart';
 
 const String kSignalingServerUrl = 'https://rjsw7olwsc3y.share.zrok.io';
 
@@ -59,6 +60,7 @@ class CallService with ChangeNotifier {
 
   bool _isMuted = false;
   bool _isSpeakerOn = false;
+  bool _isDisposed = false; // Add disposed flag
   
   // ICE candidate buffering
   final List<Map<String, dynamic>> _bufferedIceCandidates = [];
@@ -101,6 +103,12 @@ class CallService with ChangeNotifier {
   String? get lastError => _lastError;
   bool get isCameraOn => _isCameraOn;
   bool get isScreenSharing => _isScreenSharing;
+  
+  // Expose socket for heartbeat (read-only)
+  IO.Socket? get socket => _socket;
+  
+  // Check if service is disposed
+  bool get isDisposed => _isDisposed;
 
   Future<void> _applyInCallAudioRoute() async {
     debugPrint('🔧 Applying in-call audio route...');
@@ -112,25 +120,61 @@ class CallService with ChangeNotifier {
       debugPrint('🔧 Skipping audio route on non-Android');
       return;
     }
+
     try {
+      // Get local audio tracks and ensure they're enabled
       final audioTracks = _localStream?.getAudioTracks() ?? [];
-      debugPrint('🔧 Local audio tracks count: ${audioTracks.length}');
       if (audioTracks.isNotEmpty) {
-        await Helper.setMicrophoneMute(false, audioTracks.first);
-        audioTracks.first.enabled = true;
-        debugPrint('🔧 Mic unmuted and enabled');
+        // Force enable all audio tracks
+        for (final track in audioTracks) {
+          track.enabled = true;
+          debugPrint('🔧 Audio track enabled: ${track.id}');
+          
+          // Set volume to maximum for each track
+          try {
+            await Helper.setVolume(1.0, track);
+            debugPrint('🔧 Volume set to maximum for track: ${track.id}');
+          } catch (e) {
+            debugPrint('🔧 Failed to set volume for track: $e');
+          }
+        }
       } else {
         debugPrint('🔧 No local audio tracks found');
       }
     } catch (e) {
-      debugPrint('🔧 In-call mic route setup failed: $e');
+      debugPrint('🔧 Failed to configure audio tracks: $e');
     }
 
     try {
+      // Force speaker phone on for better audio routing
       await setSpeakerOn(true);
-      debugPrint('🔧 Speaker forced ON');
+      debugPrint('🔧 Speaker phone forced ON');
     } catch (e) {
-      debugPrint('🔧 In-call speaker route setup failed: $e');
+      debugPrint('🔧 Failed to enable speaker: $e');
+    }
+    
+    // Additional audio routing for better compatibility
+    try {
+      // Use WebRTC's built-in speaker phone control
+      await Helper.setSpeakerphoneOn(true);
+      debugPrint('🔧 WebRTC speakerphone enabled');
+    } catch (e) {
+      debugPrint('🔧 WebRTC speakerphone failed: $e');
+    }
+    
+    // Final verification
+    try {
+      final audioTracks = _localStream?.getAudioTracks() ?? [];
+      final enabledTracks = audioTracks.where((track) => track.enabled).length;
+      debugPrint('🔧 Audio verification: $enabledTracks/${audioTracks.length} tracks enabled');
+      
+      if (enabledTracks == 0) {
+        debugPrint('🔧 WARNING: No audio tracks are enabled!');
+      } else {
+        debugPrint('🔧 ✅ Audio routing completed successfully');
+      }
+    } catch (e) {
+      debugPrint('🔧 Audio verification failed: $e');
     }
   }
 
@@ -590,7 +634,11 @@ class CallService with ChangeNotifier {
     
     // Handle incoming calls
     _socket!.on('incomingCall', (data) {
-      debugPrint('Incoming call from: ${data['from']}');
+      debugPrint('🔔 INCOMING CALL - Full data: $data');
+      debugPrint('🔔 INCOMING CALL - From: ${data['from']}');
+      debugPrint('🔔 INCOMING CALL - Signal: ${data['signal']}');
+      debugPrint('🔔 INCOMING CALL - RoomId: ${data['roomId']}');
+      
       _remoteUserId = data['from'];
       _roomId = data is Map ? data['roomId']?.toString() : null;
       _participants
@@ -614,6 +662,10 @@ class CallService with ChangeNotifier {
       if (_roomId != null && _roomId!.isNotEmpty) {
         rawOffer['roomId'] = _roomId;
       }
+      
+      debugPrint('🔔 INCOMING CALL - Processed offer: $rawOffer');
+      debugPrint('🔔 INCOMING CALL - Offer SDP: ${rawOffer['sdp']}');
+      debugPrint('🔔 INCOMING CALL - Offer Type: ${rawOffer['type']}');
 
       _incomingCallController.add({
         'from': data['from'],
@@ -675,16 +727,16 @@ class CallService with ChangeNotifier {
     
     // Handle ICE candidates for 1:1 calls
     _socket!.on('iceCandidate', (data) async {
-      debugPrint('Received ICE candidate: $data');
+      debugPrint('🧊 RECEIVED ICE CANDIDATE: $data');
       if (data is Map && data['candidate'] != null && data['from'] != null) {
         final from = data['from']?.toString();
         final candidate = data['candidate'];
         if (from != null && candidate is Map) {
-          debugPrint('Processing ICE candidate from $from');
+          debugPrint('🧊 Processing ICE candidate from $from');
           await _handleIceCandidate(Map<String, dynamic>.from(candidate));
         }
       } else if (data is Map) {
-        debugPrint('Processing legacy ICE candidate');
+        debugPrint('🧊 Processing legacy ICE candidate');
         await _handleIceCandidate(Map<String, dynamic>.from(data));
       }
     });
@@ -892,10 +944,18 @@ class CallService with ChangeNotifier {
       debugPrint('Connected to signaling server');
       debugPrint('Emitting register for userId: $_currentUserId');
       _socket!.emit('register', _currentUserId); // Backend expects 'register', not 'registerUser'
+      
+      // Start heartbeat when connected
+      SocketHeartbeat().onSocketConnected();
+      SocketHeartbeat().start();
     });
     
     _socket!.on('disconnect', (_) {
       debugPrint('Disconnected from signaling server');
+      
+      // Stop heartbeat when disconnected
+      SocketHeartbeat().onSocketDisconnected();
+      SocketHeartbeat().stop();
 
       if (_callState == CallState.dialing ||
           _callState == CallState.ringing ||
@@ -1177,16 +1237,24 @@ class CallService with ChangeNotifier {
 
   /// Accept an incoming call
   Future<void> acceptCall(String from, Map<String, dynamic> offerData, String callId) async {
+    debugPrint('🤙 ACCEPT CALL - From: $from');
+    debugPrint('🤙 ACCEPT CALL - Offer data: $offerData');
+    debugPrint('🤙 ACCEPT CALL - Call ID: $callId');
+    debugPrint('🤙 ACCEPT CALL - Current state: $_callState');
+    
     if (_callState != CallState.idle && _callState != CallState.ringing) {
+      debugPrint('🤙 ACCEPT CALL - ERROR: Already in a call');
       throw Exception('Already in a call');
     }
     
     try {
       final hasVideo = _offerContainsVideo(offerData);
+      debugPrint('🤙 ACCEPT CALL - Has video: $hasVideo');
       _isVideoCall = hasVideo;
       await _initializeWebRTC(enableVideo: hasVideo);
 
       if (_peerConnection == null) {
+        debugPrint('🤙 ACCEPT CALL - ERROR: WebRTC not initialized');
         throw Exception('WebRTC not initialized');
       }
 
@@ -1210,15 +1278,37 @@ class CallService with ChangeNotifier {
       // Vibrate for call acceptance
       await SoundManager().vibrateOnce();
       
-      debugPrint('Setting remote description from offer: $offerData');
+      debugPrint('🤙 ACCEPT CALL - Setting remote description from offer: $offerData');
+      debugPrint('🤙 ACCEPT CALL - SDP: ${offerData['sdp']}');
+      debugPrint('🤙 ACCEPT CALL - Type: ${offerData['type']}');
       
       // IMPORTANT: Set remote description FIRST before creating answer
+      if (offerData['sdp'] == null || offerData['type'] == null) {
+        debugPrint('🤙 ACCEPT CALL - ERROR: Missing SDP or type in offer');
+        throw Exception('Invalid offer data: missing SDP or type');
+      }
+      
       await _peerConnection!.setRemoteDescription(
         RTCSessionDescription(offerData['sdp'], offerData['type'])
       );
       
+      debugPrint('🤙 ACCEPT CALL - Remote description set successfully');
+      
       // Process any buffered ICE candidates
       await _processBufferedIceCandidates();
+      
+      // Also process buffered room ICE candidates if we have a roomId
+      if (_roomId != null && _roomId!.isNotEmpty) {
+        debugPrint('🧊 Processing buffered room ICE candidates for roomId: $_roomId');
+        await _processBufferedRoomIce(from);
+        
+        // Retry processing room ICE candidates after a short delay
+        // to handle timing issues with remote description
+        Future.delayed(Duration(milliseconds: 500), () async {
+          debugPrint('🧊 Retrying buffered room ICE candidates after delay');
+          await _processBufferedRoomIce(from);
+        });
+      }
       
       // Now create answer
       RTCSessionDescription answer = await _peerConnection!.createAnswer({
@@ -1226,11 +1316,15 @@ class CallService with ChangeNotifier {
         'offerToReceiveVideo': hasVideo ? 1 : 0,
       });
       
+      debugPrint('🤙 ACCEPT CALL - Answer created: ${answer.toMap()}');
+      
       // Set local description
       await _peerConnection!.setLocalDescription(answer);
       
+      debugPrint('🤙 ACCEPT CALL - Local description set');
+      
       // Send answer to caller
-      debugPrint('Sending answer to $from: ${answer.toMap()}');
+      debugPrint('🤙 ACCEPT CALL - Sending answer to $from: ${answer.toMap()}');
       _socket!.emit('answerCall', {
         'to': from, // Backend expects 'to'
         'signal': answer.toMap(), // Backend expects 'signal'
@@ -1376,45 +1470,56 @@ class CallService with ChangeNotifier {
 
   /// Process buffered ICE candidates after remote description is set
   Future<void> _processBufferedIceCandidates() async {
-    if (_bufferedIceCandidates.isEmpty) return;
+    if (_bufferedIceCandidates.isEmpty) {
+      debugPrint('🧊 No buffered ICE candidates to process');
+      return;
+    }
     
-    debugPrint('Processing ${_bufferedIceCandidates.length} buffered ICE candidates');
+    debugPrint('🧊 Processing ${_bufferedIceCandidates.length} buffered ICE candidates');
     
     for (final candidateData in _bufferedIceCandidates) {
       try {
+        debugPrint('🧊 Processing buffered candidate: $candidateData');
         await _handleIceCandidate(candidateData);
       } catch (e) {
-        debugPrint('Failed to process buffered ICE candidate: $e');
+        debugPrint('🧊 Failed to process buffered ICE candidate: $e');
       }
     }
     
     _bufferedIceCandidates.clear();
+    debugPrint('🧊 Buffered ICE candidates cleared');
   }
 
   /// Handle incoming ICE candidate
   Future<void> _handleIceCandidate(Map<String, dynamic> candidateData) async {
     try {
-      debugPrint('Received ICE candidate data: $candidateData');
+      debugPrint('🧊 ICE CANDIDATE DATA: $candidateData');
       
-      // Check if remote description is set before adding ICE candidates
-      final remoteDesc = await _peerConnection?.getRemoteDescription();
-      if (remoteDesc == null) {
-        debugPrint('Remote description not set yet, buffering ICE candidate');
-        // Buffer the candidate for later
-        _bufferedIceCandidates.add(candidateData);
+      if (_peerConnection == null) {
+        debugPrint('🧊 Peer connection is null, cannot add ICE candidate');
         return;
       }
       
-      // Handle different possible data structures from backend
-      Map<String, dynamic> candidate;
+      final remoteDesc = await _peerConnection!.getRemoteDescription();
+      if (remoteDesc == null) {
+        debugPrint('🧊 Remote description not set yet, buffering ICE candidate');
+        // Buffer the candidate for later
+        _bufferedIceCandidates.add(candidateData);
+        debugPrint('🧊 Buffered ICE candidates count: ${_bufferedIceCandidates.length}');
+        return;
+      }
       
-      if (candidateData.containsKey('candidate') && candidateData.containsKey('sdpMid')) {
-        // Direct structure: {candidate: "...", sdpMid: "...", sdpMLineIndex: ...}
-        candidate = candidateData;
-      } else if (candidateData.containsKey('candidate') && candidateData['candidate'] is Map) {
-        // Nested structure: {candidate: {candidate: "...", sdpMid: "...", sdpMLineIndex: ...}}
-        candidate = candidateData['candidate'];
-      } else {
+      debugPrint('🧊 Adding ICE candidate to peer connection');
+      
+      // Handle both direct candidate format and nested format
+      final candidate = candidateData['candidate'] is Map 
+          ? Map<String, dynamic>.from(candidateData['candidate'] as Map)
+          : candidateData;
+      
+      if (!candidate.containsKey('candidate') || 
+          !candidate.containsKey('sdpMid') || 
+          !candidate.containsKey('sdpMLineIndex')) {
+        debugPrint('🧊 Invalid ICE candidate data structure: $candidateData');
         throw Exception('Invalid ICE candidate data structure: $candidateData');
       }
       
@@ -1425,18 +1530,12 @@ class CallService with ChangeNotifier {
       );
       
       await _peerConnection!.addCandidate(iceCandidate);
-      debugPrint('ICE candidate added successfully');
+      debugPrint('🧊 ✅ ICE candidate added successfully');
       
       // Check if connection is established after adding candidate
-      if (_callState == CallState.connecting) {
-        // Give it a moment to establish connection
-        Future.delayed(Duration(seconds: 2), () {
-          if (_callState == CallState.connecting && _remoteStream != null) {
-            _updateCallState(CallState.connected);
-            SoundManager().playCallConnectedSound();
-          }
-        });
-      }
+      final iceState = _peerConnection!.getIceConnectionState();
+      debugPrint('🧊 ICE connection state after adding candidate: $iceState');
+      
     } catch (e) {
       debugPrint('Failed to handle ICE candidate: $e');
     }
@@ -1566,19 +1665,40 @@ class CallService with ChangeNotifier {
     String from,
     Map<String, dynamic> candidateData,
   ) async {
-    final pc = _peerConnections[from];
+    debugPrint('🧊 ROOM ICE CANDIDATE from $from: $candidateData');
+    debugPrint('🧊 Current roomId: $_roomId, peerConnections: ${_peerConnections.keys}');
+    
+    // For 1:1 calls that use roomId, also check the main peer connection
+    final pc = _peerConnections[from] ?? _peerConnection;
     if (pc == null) {
+      debugPrint('🧊 No peer connection for $from, buffering room ICE candidate');
       _bufferedRoomIceCandidates.putIfAbsent(from, () => []).add(candidateData);
       return;
     }
 
     final remoteDesc = await pc.getRemoteDescription();
     if (remoteDesc == null) {
+      debugPrint('🧊 Remote description not set for $from, buffering room ICE candidate');
       _bufferedRoomIceCandidates.putIfAbsent(from, () => []).add(candidateData);
+      
+      // Set up a retry mechanism to process this candidate later
+      Future.delayed(Duration(milliseconds: 1000), () async {
+        debugPrint('🧊 RETRY: Attempting to process buffered room ICE candidate for $from');
+        final retryDesc = await pc.getRemoteDescription();
+        if (retryDesc != null) {
+          debugPrint('🧊 RETRY: Remote description now set, processing candidate');
+          await _handleRoomIceCandidate(from, candidateData);
+        } else {
+          debugPrint('🧊 RETRY: Remote description still not set, keeping buffered');
+        }
+      });
+      
       return;
     }
 
-    final candidate = candidateData.containsKey('candidate') && candidateData['candidate'] is Map
+    debugPrint('🧊 Adding room ICE candidate to peer connection for $from');
+
+    final candidate = candidateData['candidate'] is Map 
         ? Map<String, dynamic>.from(candidateData['candidate'] as Map)
         : candidateData;
 
@@ -1587,20 +1707,36 @@ class CallService with ChangeNotifier {
       candidate['sdpMid'],
       candidate['sdpMLineIndex'],
     );
+
     await pc.addCandidate(ice);
+    debugPrint('🧊 ✅ Room ICE candidate added successfully for $from');
+    
+    // Check connection state
+    final iceState = pc.getIceConnectionState();
+    debugPrint('🧊 ICE connection state after room candidate: $iceState');
   }
 
   Future<void> _processBufferedRoomIce(String from) async {
-    final pc = _peerConnections[from];
-    if (pc == null) return;
+    debugPrint('🧊 Processing buffered room ICE for $from');
+    // For 1:1 calls that use roomId, also check the main peer connection
+    final pc = _peerConnections[from] ?? _peerConnection;
+    if (pc == null) {
+      debugPrint('🧊 No peer connection for $from to process buffered ICE');
+      return;
+    }
     final list = _bufferedRoomIceCandidates[from];
-    if (list == null || list.isEmpty) return;
+    if (list == null || list.isEmpty) {
+      debugPrint('🧊 No buffered room ICE candidates for $from');
+      return;
+    }
+    debugPrint('🧊 Processing ${list.length} buffered room ICE candidates for $from');
     for (final c in List<Map<String, dynamic>>.from(list)) {
       try {
         await _handleRoomIceCandidate(from, c);
       } catch (_) {}
     }
     _bufferedRoomIceCandidates[from]?.clear();
+    debugPrint('🧊 Buffered room ICE candidates cleared for $from');
   }
 
   /// End the current call
@@ -1655,6 +1791,8 @@ class CallService with ChangeNotifier {
   
   /// Update call state and notify listeners
   void _updateCallState(CallState newState) {
+    if (_isDisposed) return; // Don't update if disposed
+    
     final previousState = _callState;
     _callState = newState;
 
@@ -1682,37 +1820,75 @@ class CallService with ChangeNotifier {
       _callDurationTimer = null;
     }
 
-    _callStateController.add({
-      'callState': _callState,
-      'remoteUserId': _remoteUserId,
-      'isMuted': _isMuted,
-      'isSpeakerOn': _isSpeakerOn,
-      'isVideoCall': _isVideoCall,
-      'isCameraOn': _isCameraOn,
-      'isScreenSharing': _isScreenSharing,
-      'callDurationMs': _callDuration.inMilliseconds,
-      'error': _lastError,
-    });
+    if (!_isDisposed) {
+      _callStateController.add({
+        'callState': _callState,
+        'remoteUserId': _remoteUserId,
+        'isMuted': _isMuted,
+        'isSpeakerOn': _isSpeakerOn,
+        'isVideoCall': _isVideoCall,
+        'isCameraOn': _isCameraOn,
+        'isScreenSharing': _isScreenSharing,
+        'callDurationMs': _callDuration.inMilliseconds,
+        'error': _lastError,
+      });
+    }
 
     if (newState != CallState.idle && _lastError != null) {
       _lastError = null;
     }
   }
 
-  /// Dispose of all resources
-  void dispose() {
-    _endCall();
+  /// Clean up all resources and stop services
+  Future<void> dispose() async {
+    if (_isDisposed) return; // Prevent multiple disposals
     
+    debugPrint('🔧 🔴 DISPOSE CALLED - Stack trace:');
+    debugPrint(StackTrace.current.toString());
+    _isDisposed = true;
+    
+    debugPrint('🔧 Disposing CallService...');
+    
+    // Stop heartbeat
+    SocketHeartbeat().stop();
+    
+    // Stop background services
+    try {
+      await CallRingingPlatform.stopRinging();
+    } catch (e) {
+      debugPrint('🔧 Failed to stop ringing: $e');
+    }
+    
+    // End any active call
+    if (_callState != CallState.idle) {
+      endCall();
+    }
+    
+    // Disconnect socket properly
+    if (_socket != null) {
+      try {
+        _socket!.disconnect();
+        _socket!.dispose();
+        debugPrint('🔧 Socket disconnected and disposed');
+      } catch (e) {
+        debugPrint('🔧 Error disposing socket: $e');
+      }
+      _socket = null;
+    }
+    
+    // Cleanup WebRTC resources
+    await _cleanupCallResources();
+    
+    // Stop local stream
     _localStream?.getTracks().forEach((track) => track.stop());
     _localStream?.dispose();
     _remoteStream?.dispose();
     
+    // Dispose peer connection
     _peerConnection?.close();
     _peerConnection?.dispose();
     
-    _socket?.disconnect();
-    _socket?.dispose();
-    
+    // Close controllers
     _callStateController.close();
     _incomingCallController.close();
     _remoteStreamController.close();
@@ -1721,6 +1897,6 @@ class CallService with ChangeNotifier {
     
     SoundManager().dispose();
     
-    debugPrint('CallService disposed');
+    debugPrint('🔧 CallService disposal complete');
   }
 }

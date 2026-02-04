@@ -2,18 +2,24 @@ import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:background_fetch/background_fetch.dart';
 import 'callkit_bridge.dart';
 import 'auth_screen.dart';
 import 'auth_service.dart';
 import 'call_screen.dart';
+import 'incoming_call_screen.dart';
 import 'call_service.dart';
 import 'background_call_service.dart';
+import 'background_service.dart';
 import 'set_call_id_screen.dart';
 import 'pending_call_accept.dart';
+import 'socket_heartbeat.dart';
+import 'background_keep_alive_platform.dart';
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
@@ -312,6 +318,9 @@ Future<void> _initializeFcm() async {
     final type = message.data['type']?.toString();
     if (type == 'INCOMING_CALL') {
       showIncomingCallUI(message.data);
+    } else if (message.data['incomingCall'] == 'true') {
+      // Handle notification tap from our enhanced notification
+      _handleNotificationTap(message.data);
     }
   });
 
@@ -322,6 +331,60 @@ Future<void> _initializeFcm() async {
     final type = initialMessage.data['type']?.toString();
     if (type == 'INCOMING_CALL') {
       showIncomingCallUI(initialMessage.data);
+    } else if (initialMessage.data['incomingCall'] == 'true') {
+      // Handle notification tap from our enhanced notification
+      _handleNotificationTap(initialMessage.data);
+    }
+  }
+}
+
+void _handleNotificationTap(Map<String, dynamic> data) {
+  debugPrint('[FCM][notification_tap] Opening call screen with data: $data');
+  
+  final callId = data['callId']?.toString() ?? '';
+  final from = data['callerId']?.toString() ?? data['from']?.toString() ?? '';
+  final roomId = data['roomId']?.toString() ?? '';
+  final isVideo = data['isVideo']?.toString() == 'true';
+  final autoAnswer = data['autoAnswer']?.toString() == 'true';
+  final showCallScreen = data['showCallScreen']?.toString() == 'true';
+  
+  if (callId.isNotEmpty && from.isNotEmpty) {
+    if (showCallScreen) {
+      // Navigate directly to the main CallScreen (full call interface)
+      // If autoAnswer is true, set up pending auto-accept for when the offer arrives
+      if (autoAnswer) {
+        debugPrint('[FCM][notification_tap] Setting up auto-accept for call from $from');
+        final callService = CallService();
+        // Set pending auto-accept - this will be triggered when the incoming call event arrives
+        callService.armAutoAccept({
+          'from': from,
+          'roomId': roomId,
+          'callId': callId,
+        });
+      }
+      
+      navigatorKey.currentState?.push(
+        MaterialPageRoute(
+          builder: (context) => CallScreen(
+            userId: '', // Will be set by CallService
+            primaryBaseUrl: 'https://rjsw7olwsc3y.share.zrok.io',
+            fallbackBaseUrl: 'http://localhost:5000',
+          ),
+        ),
+      );
+    } else {
+      // Navigate to incoming call screen (for manual answer)
+      navigatorKey.currentState?.push(
+        MaterialPageRoute(
+          builder: (context) => IncomingCallScreen(
+            callId: callId,
+            remoteUserId: from,
+            roomId: roomId,
+            isVideoCall: isVideo,
+            autoAnswer: autoAnswer,
+          ),
+        ),
+      );
     }
   }
 }
@@ -404,7 +467,7 @@ class AppNavigator extends StatefulWidget {
   State<AppNavigator> createState() => _AppNavigatorState();
 }
 
-class _AppNavigatorState extends State<AppNavigator> {
+class _AppNavigatorState extends State<AppNavigator> with WidgetsBindingObserver {
   String? _registeredUserId;
   String? _callUserId;
   bool _isInitializing = false;
@@ -417,7 +480,79 @@ class _AppNavigatorState extends State<AppNavigator> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _bootstrapAuth();
+    _initializeBackgroundServices();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    // Clean up CallService when app is disposed
+    CallService().dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    
+    switch (state) {
+      case AppLifecycleState.paused:
+        debugPrint('🔧 App paused - KEEPING socket connected for background calls');
+        // DON'T disconnect socket - keep it alive for background calls
+        break;
+      case AppLifecycleState.resumed:
+        debugPrint('🔧 App resumed');
+        // Socket should still be connected, no action needed
+        break;
+      case AppLifecycleState.detached:
+        debugPrint('🔧 App detached - cleaning up resources');
+        // Only cleanup when app is completely destroyed (rare)
+        break;
+      case AppLifecycleState.inactive:
+        debugPrint('🔧 App inactive');
+        break;
+      case AppLifecycleState.hidden:
+        debugPrint('🔧 App hidden - STILL KEEPING socket connected');
+        // IMPORTANT: Keep socket connected even when hidden
+        break;
+    }
+  }
+
+  void _forceSocketDisconnect() {
+    try {
+      debugPrint('🔧 Force disconnecting socket...');
+      final callService = CallService();
+      if (!callService.isDisposed) {
+        callService.dispose();
+        SocketHeartbeat().stop();
+        debugPrint('🔧 Socket force disconnected');
+      } else {
+        debugPrint('🔧 CallService already disposed');
+      }
+    } catch (e) {
+      debugPrint('🔧 Error force disconnecting socket: $e');
+    }
+  }
+
+  Future<void> _initializeBackgroundServices() async {
+    try {
+      // Initialize background services for persistent execution
+      await BackgroundService().initialize();
+      debugPrint('🟢 Background services initialized');
+      
+      // Start app state monitor service
+      await BackgroundKeepAlivePlatform.startBackgroundService();
+      debugPrint('🟢 App state monitor started');
+      
+      // Test background service after a delay
+      Future.delayed(const Duration(seconds: 5), () {
+        debugPrint('🔧 Background service should be running now');
+      });
+    } catch (e) {
+      debugPrint('🔴 Failed to initialize background services: $e');
+    }
   }
 
   Future<void> _bootstrapAuth() async {

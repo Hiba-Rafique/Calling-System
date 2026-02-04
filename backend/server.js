@@ -118,16 +118,39 @@ async function sendFcmDataMessage(token, data) {
   if (!firebaseEnabled) return false;
   if (!token) return false;
   try {
+    // Clean the data payload to avoid reserved Firebase keywords
+    const cleanData = {};
+    Object.entries(data || {}).forEach(([k, v]) => {
+      // Avoid reserved Firebase keywords like 'from', 'to', etc.
+      const cleanKey = k === 'from' ? 'callerId' : 
+                      k === 'to' ? 'calleeId' : 
+                      k;
+      cleanData[cleanKey] = v == null ? '' : String(v);
+    });
+    
+    // Create dynamic notification with caller's name
+    const callerName = data.from || 'Someone';
+    const notificationTitle = `Incoming Call from ${callerName}`;
+    const notificationBody = data.isVideoCall === 'true' ? 'Video call' : 'Voice call';
+    
     const messageId = await admin.messaging().send({
       token,
       android: {
         priority: 'high',
+        ttl: 0, // Immediate delivery
+        collapseKey: 'incoming_call', // Prevent duplicate collapse
+        notification: {
+          title: notificationTitle,
+          body: notificationBody,
+          sound: 'default',
+          icon: 'ic_notification',
+          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+          priority: 'high'
+        }
       },
-      data: Object.fromEntries(
-        Object.entries(data || {}).map(([k, v]) => [k, v == null ? '' : String(v)])
-      ),
+      data: cleanData,
     });
-    console.log('FCM send ok messageId=', messageId, 'type=', data && data.type);
+    console.log('FCM send ok messageId=', messageId, 'type=', data && data.type, 'originalData=', data, 'cleanData=', cleanData);
     return true;
   } catch (e) {
     console.error('FCM send failed:', e);

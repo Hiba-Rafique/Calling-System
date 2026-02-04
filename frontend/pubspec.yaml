@@ -40,6 +40,8 @@ dependencies:
   # Background calling dependencies
   flutter_local_notifications: ^17.2.3
   permission_handler: ^11.3.1
+  # Background execution and keep-alive
+  background_fetch: ^1.2.1
 
   http: ^1.2.2
   shared_preferences: ^2.2.3

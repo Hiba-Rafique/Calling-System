@@ -122,8 +122,6 @@ class CallRingingForegroundService : Service() {
         vibrationPattern = longArrayOf(0, 1000, 500, 1000)
         setShowBadge(true)
         lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-        // Ensure vibration is enabled
-        setVibrationEnabled(true)
       }
       val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
       manager.createNotificationChannel(channel)
@@ -140,15 +138,17 @@ class CallRingingForegroundService : Service() {
     val content = if (isVideo) "Incoming video call" else "Incoming voice call"
     
     // Create intent to open app with full call screen
-    val fullScreenIntent = Intent(this, MainActivity::class.java)
-    fullScreenIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-    fullScreenIntent.putExtra("callId", callId)
-    fullScreenIntent.putExtra("from", from)
-    fullScreenIntent.putExtra("roomId", roomId)
-    fullScreenIntent.putExtra("isVideo", isVideo)
-    fullScreenIntent.putExtra("incomingCall", true)
-    fullScreenIntent.putExtra("showCallScreen", true) // Add flag to show full call screen
-    fullScreenIntent.action = "ANSWER_CALL"
+    val fullScreenIntent = Intent(this, MainActivity::class.java).apply {
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        putExtra("callId", callId)
+        putExtra("from", from)
+        putExtra("roomId", roomId)
+        putExtra("isVideo", isVideo)
+        putExtra("incomingCall", true)
+        putExtra("showCallScreen", true) // Add flag to show full call screen
+        putExtra("autoAnswer", false) // Don't auto-answer from notification tap
+        action = "ANSWER_CALL"
+    }
     
     val fullScreenPending = PendingIntent.getActivity(
       this, 0, fullScreenIntent,
@@ -156,37 +156,56 @@ class CallRingingForegroundService : Service() {
     )
     
     // Accept intent - same as full screen intent but with autoAnswer
-    val acceptIntent = Intent(this, MainActivity::class.java)
-    acceptIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-    acceptIntent.putExtra("callId", callId)
-    acceptIntent.putExtra("from", from)
-    acceptIntent.putExtra("roomId", roomId)
-    acceptIntent.putExtra("isVideo", isVideo)
-    acceptIntent.putExtra("incomingCall", true)
-    acceptIntent.putExtra("showCallScreen", true) // Add flag to show full call screen
-    acceptIntent.putExtra("autoAnswer", true) // Auto-accept when Answer button is tapped
-    acceptIntent.action = "ANSWER_CALL"
+    val acceptIntent = Intent(this, MainActivity::class.java).apply {
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        putExtra("callId", callId)
+        putExtra("from", from)
+        putExtra("roomId", roomId)
+        putExtra("isVideo", isVideo)
+        putExtra("incomingCall", true)
+        putExtra("showCallScreen", true) // Add flag to show full call screen
+        putExtra("autoAnswer", true) // Auto-accept when Answer button is tapped
+        action = "ANSWER_CALL"
+    }
     
-    val acceptPending = PendingIntent.getActivity(
+    val acceptPending = PendingIntent.getBroadcast(
       this, 1, acceptIntent,
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     )
     
     // Decline intent
-    val declineIntent = Intent(this, IncomingCallActionReceiver::class.java)
-    declineIntent.putExtra("callId", callId)
-    declineIntent.putExtra("from", from)
-    declineIntent.putExtra("roomId", roomId)
-    declineIntent.putExtra("isVideo", isVideo)
-    declineIntent.action = "DECLINE_CALL"
+    val declineIntent = Intent(this, NotificationTapReceiver::class.java).apply {
+        action = "OPEN_CALL_SCREEN"
+        putExtra("callId", callId)
+        putExtra("from", from)
+        putExtra("roomId", roomId)
+        putExtra("isVideo", isVideo)
+        putExtra("incomingCall", true)
+        putExtra("showCallScreen", true)
+        putExtra("autoAnswer", false)
+        putExtra("declineCall", true) // Add flag for decline
+      }
     
     val declinePending = PendingIntent.getBroadcast(
       this, 2, declineIntent,
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     )
 
+    // Also send a broadcast as backup
+      val broadcastIntent = Intent(this, NotificationTapReceiver::class.java).apply {
+        action = "OPEN_CALL_SCREEN"
+        putExtra("callId", callId)
+        putExtra("from", from)
+        putExtra("roomId", roomId)
+        putExtra("isVideo", isVideo)
+        putExtra("incomingCall", true)
+        putExtra("showCallScreen", true)
+        putExtra("autoAnswer", false)
+      }
+      sendBroadcast(broadcastIntent)
+
     return NotificationCompat.Builder(this, CHANNEL_ID)
-      .setSmallIcon(android.R.drawable.stat_notify_phone)
+      .setSmallIcon(android.R.drawable.ic_menu_call)
       .setContentTitle(title)
       .setContentText(content)
       .setCategory(NotificationCompat.CATEGORY_CALL)
@@ -198,8 +217,8 @@ class CallRingingForegroundService : Service() {
       .setVibrate(longArrayOf(0, 1000, 500, 1000)) // Explicit vibration pattern
       .setFullScreenIntent(fullScreenPending, true)
       .setContentIntent(fullScreenPending) // Open app when notification is tapped
-      .setColorized(true)
-      .setColor(0xFF4CAF50) // WhatsApp green color
+      .setDeleteIntent(fullScreenPending) // Also open when notification is dismissed
+      .setColor(0xFF4CAF50.toInt()) // WhatsApp green color
       .addAction(
         android.R.drawable.ic_menu_close_clear_cancel,
         "Decline",

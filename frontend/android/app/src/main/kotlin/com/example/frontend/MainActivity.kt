@@ -3,6 +3,7 @@ package com.example.frontend
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.android.FlutterActivity
@@ -90,5 +91,49 @@ class MainActivity : FlutterActivity() {
         super.onCreate(savedInstanceState)
         // Start background keep-alive service when app starts
         BackgroundKeepAliveService.start(this)
+        
+        // Handle intent if app was opened from notification
+        intent?.let { 
+            Log.d("MainActivity", "Processing initial intent: ${it.action}")
+            handleCallIntent(it) 
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        Log.d("MainActivity", "Processing new intent: ${intent.action}")
+        // Handle incoming call intents from notification taps
+        handleCallIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Log.d("MainActivity", "onResume")
+        // Check for any pending call intents when app resumes
+        intent?.let { handleCallIntent(it) }
+    }
+
+    private fun handleCallIntent(intent: Intent) {
+        when (intent.action) {
+            "ANSWER_CALL" -> {
+                Log.d("MainActivity", "Handling ANSWER_CALL intent")
+                // Forward call data to Flutter
+                val callData = mapOf(
+                    "callId" to (intent.getStringExtra("callId") ?: ""),
+                    "from" to (intent.getStringExtra("from") ?: ""),
+                    "roomId" to (intent.getStringExtra("roomId") ?: ""),
+                    "isVideo" to (intent.getBooleanExtra("isVideo", false)),
+                    "incomingCall" to (intent.getBooleanExtra("incomingCall", false)),
+                    "showCallScreen" to (intent.getBooleanExtra("showCallScreen", false)),
+                    "autoAnswer" to (intent.getBooleanExtra("autoAnswer", false))
+                )
+                
+                // Send to Flutter via method channel
+                flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
+                    MethodChannel(messenger, "com.example.frontend/call_intent")
+                        .invokeMethod("onCallIntent", callData)
+                }
+            }
+        }
     }
 }

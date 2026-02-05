@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Frontend</string>
+	<string>Calling System</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -46,15 +46,17 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>This app needs camera access for video calling.</string>
+	<string>This app needs camera access for video calling with friends and family.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>This app needs microphone access for calling.</string>
+	<string>This app needs microphone access for voice calling with friends and family.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>background-fetch</string>
 		<string>remote-notification</string>
 		<string>voip</string>
 		<string>audio</string>
+		<string>background-processing</string>
+		<string>background-app-refresh</string>
 	</array>
 	<key>UIUserNotificationType</key>
 	<array>

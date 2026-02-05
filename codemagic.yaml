@@ -1,7 +1,7 @@
 workflows:
   flutter-ios:
-    name: Flutter iOS
-    max_build_duration: 60
+    name: Flutter iOS IPA Build
+    max_build_duration: 90
     environment:
       flutter: stable
       xcode: latest
@@ -11,13 +11,20 @@ workflows:
         script: |
           cd frontend
           flutter pub get
-      - name: Install CocoaPods
+          flutter clean
+      - name: Install CocoaPods dependencies
         script: |
           cd frontend/ios
           pod install --repo-update
-      - name: Build iOS IPA
+          pod update
+      - name: Build iOS IPA with proper configuration
         script: |
           cd frontend
-          flutter build ios --release --no-codesign
+          flutter build ios --release --no-codesign --export-options-plist=ios/ExportOptions.plist
     artifacts:
       - frontend/build/ios/ipa/*.ipa
+      - frontend/build/ios/archive/Runner.xcarchive
+    publishing:
+      email:
+        recipients:
+          - user@example.com

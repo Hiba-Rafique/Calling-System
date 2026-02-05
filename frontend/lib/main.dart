@@ -62,6 +62,63 @@ Future<void> _initializeLocalNotifications() async {
       ),
     );
   }
+
+  // Setup method channel for Android call intents
+  const callIntentChannel = MethodChannel('com.example.frontend/call_intent');
+  callIntentChannel.setMethodCallHandler((call) async {
+    if (call.method == 'onCallIntent') {
+      final callData = Map<String, dynamic>.from(call.arguments);
+      debugPrint('[CALL_INTENT] Received call intent: $callData');
+      
+      // Handle incoming call from notification tap
+      if (callData['showCallScreen'] == true) {
+        final cachedMe = await AuthService().getCachedMe();
+        final userId = cachedMe?['call_user_id']?.toString() ?? '';
+        final primaryUrl = 'http://192.168.18.4:5000'; // Your server URL
+        final fallbackUrl = 'http://192.168.18.4:5000'; // Your fallback URL
+        final autoAnswer = callData['autoAnswer'] == true;
+        final declineCall = callData['declineCall'] == true;
+        
+        debugPrint('[CALL_INTENT] Opening call screen for user: $userId, autoAnswer: $autoAnswer, declineCall: $declineCall');
+        
+        navigatorKey.currentState?.push(
+          MaterialPageRoute(
+            builder: (context) => CallScreen(
+              userId: userId,
+              primaryBaseUrl: primaryUrl,
+              fallbackBaseUrl: fallbackUrl,
+            ),
+          ),
+        );
+        
+        // If declineCall is true, decline the call
+        if (declineCall) {
+          Future.delayed(Duration(milliseconds: 500), () async {
+            final callService = CallService();
+            if (callData['callId'] != null) {
+              callService.endCall();
+            }
+          });
+        }
+        // If autoAnswer is true, accept the call
+        else if (autoAnswer) {
+          Future.delayed(Duration(milliseconds: 500), () async {
+            final callService = CallService();
+            if (callData['callId'] != null) {
+              await callService.acceptCall(
+                callData['from']?.toString() ?? '',
+                {
+                  'sdp': callData['offer']?['sdp'] ?? '',
+                  'type': callData['offer']?['type'] ?? 'offer',
+                },
+                callData['callId']?.toString() ?? '',
+              );
+            }
+          });
+        }
+      }
+    }
+  });
 }
 
 /// IMPORTANT: Top-level FCM background handler.

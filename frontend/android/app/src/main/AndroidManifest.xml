@@ -69,6 +69,15 @@
         <receiver
             android:name="com.example.frontend.IncomingCallActionReceiver"
             android:exported="false" />
+        
+        <receiver
+            android:name="com.example.frontend.NotificationTapReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="OPEN_CALL_SCREEN"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+            </intent-filter>
+        </receiver>
 
         <!-- Service heartbeat receiver -->
         <receiver
@@ -119,6 +128,10 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="ANSWER_CALL"/>
+                <category android:name="android.intent.category.DEFAULT"/>
             </intent-filter>
         </activity>
 

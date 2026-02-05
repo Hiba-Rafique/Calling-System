@@ -743,12 +743,12 @@ class CallService with ChangeNotifier {
 
     // Handle ICE candidates for room calls
     _socket!.on('roomIceCandidate', (data) async {
-      debugPrint('Received room ICE candidate: $data');
+      debugPrint('🧊 RECEIVED ROOM ICE CANDIDATE: $data');
       if (data is Map && data['candidate'] != null && data['from'] != null) {
         final from = data['from']?.toString();
         final candidate = data['candidate'];
         if (from != null && candidate is Map) {
-          debugPrint('Processing room ICE candidate from $from');
+          debugPrint('🧊 Processing room ICE candidate from $from');
           await _handleRoomIceCandidate(from, Map<String, dynamic>.from(candidate));
         }
       }
@@ -864,16 +864,6 @@ class CallService with ChangeNotifier {
       if (rid == null || from == null || signal is! Map) return;
       if (_roomId != null && rid != _roomId) return;
       await _handleRoomSignal(from, Map<String, dynamic>.from(signal));
-    });
-
-    _socket!.on('roomIceCandidate', (data) async {
-      if (data is! Map) return;
-      final rid = data['roomId']?.toString();
-      final from = data['from']?.toString();
-      final candidate = data['candidate'];
-      if (rid == null || from == null || candidate is! Map) return;
-      if (_roomId != null && rid != _roomId) return;
-      await _handleRoomIceCandidate(from, Map<String, dynamic>.from(candidate));
     });
     
     // Handle call ended
@@ -1673,6 +1663,19 @@ class CallService with ChangeNotifier {
     if (pc == null) {
       debugPrint('🧊 No peer connection for $from, buffering room ICE candidate');
       _bufferedRoomIceCandidates.putIfAbsent(from, () => []).add(candidateData);
+      
+      // Set up a retry mechanism to process this candidate later
+      Future.delayed(Duration(milliseconds: 500), () async {
+        debugPrint('🧊 RETRY: Attempting to process buffered room ICE candidate for $from');
+        final retryPc = _peerConnections[from] ?? _peerConnection;
+        final retryDesc = retryPc != null ? await retryPc.getRemoteDescription() : null;
+        if (retryDesc != null) {
+          debugPrint('🧊 RETRY: Remote description now set, processing candidate');
+          await _handleRoomIceCandidate(from, candidateData);
+        } else {
+          debugPrint('🧊 RETRY: Remote description still not set, keeping buffered');
+        }
+      });
       return;
     }
 
@@ -1682,7 +1685,7 @@ class CallService with ChangeNotifier {
       _bufferedRoomIceCandidates.putIfAbsent(from, () => []).add(candidateData);
       
       // Set up a retry mechanism to process this candidate later
-      Future.delayed(Duration(milliseconds: 1000), () async {
+      Future.delayed(Duration(milliseconds: 500), () async {
         debugPrint('🧊 RETRY: Attempting to process buffered room ICE candidate for $from');
         final retryDesc = await pc.getRemoteDescription();
         if (retryDesc != null) {
@@ -1708,8 +1711,12 @@ class CallService with ChangeNotifier {
       candidate['sdpMLineIndex'],
     );
 
-    await pc.addCandidate(ice);
-    debugPrint('🧊 ✅ Room ICE candidate added successfully for $from');
+    try {
+      await pc.addCandidate(ice);
+      debugPrint('🧊 ✅ Room ICE candidate added successfully for $from');
+    } catch (e) {
+      debugPrint('🧊 ❌ Failed to add room ICE candidate for $from: $e');
+    }
     
     // Check connection state
     final iceState = pc.getIceConnectionState();

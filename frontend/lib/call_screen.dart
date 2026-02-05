@@ -357,8 +357,10 @@ class _CallScreenState extends State<CallScreen> {
     debugPrint('📱 Notification response: ${response.payload}');
     
     if (response.payload != null && _currentCallTarget != null) {
-      final payload = response.payload!;
-      final action = payload['action'];
+      // Parse payload as string and extract action
+      final payloadString = response.payload.toString();
+      final action = payloadString.contains('answer_call') ? 'answer_call' : 
+                     payloadString.contains('decline_call') ? 'decline_call' : null;
       
       if (action == 'answer_call') {
         debugPrint('📱 Answer action tapped for $_currentCallTarget');
@@ -867,7 +869,7 @@ class _CallScreenState extends State<CallScreen> {
     if (!kIsWeb && _currentCallTarget != null) {
       debugPrint('📱 Showing incoming call notification for $_currentCallTarget');
       
-      const androidDetails = AndroidNotificationDetails(
+      final androidDetails = AndroidNotificationDetails(
         '@mipmap/ic_launcher',
         'incoming_calls',
         channelDescription: 'Incoming call notifications',
@@ -884,38 +886,40 @@ class _CallScreenState extends State<CallScreen> {
         sound: RawResourceAndroidNotificationSound('notification_ring'),
         color: Color.fromARGB(255, 76, 175, 80), // WhatsApp green
         icon: '@mipmap/ic_notification',
-        largeIcon: '@mipmap/ic_notification',
-        styleInformation: AndroidNotificationStyle.bigText('Call from $_currentCallTarget'),
+        largeIcon: const DrawableResourceAndroidBitmap('ic_notification'),
+        styleInformation: BigTextStyleInformation(
+          'Call from $_currentCallTarget',
+          htmlFormatBigText: false,
+          contentTitle: _currentCallTarget,
+          htmlFormatContentTitle: false,
+        ),
         // Add action buttons for background
         actions: [
           AndroidNotificationAction(
             'answer_call',
             'Answer',
-            AndroidNotificationAction.defaultAction,
             showsUserInterface: true,
           ),
           AndroidNotificationAction(
             'decline_call',
             'Decline',
-            AndroidNotificationAction.defaultAction,
             showsUserInterface: false,
           ),
         ],
       );
       
-      const iosDetails = DarwinNotificationDetails(
+      final iosDetails = DarwinNotificationDetails(
         presentAlert: true,
         presentBadge: true,
         presentSound: true,
         categoryIdentifier: 'incoming_call',
         // iOS-specific enhancements for background calls
         interruptionLevel: InterruptionLevel.timeSensitive,
-        criticalAlert: true,
         threadIdentifier: _currentCallTarget, // Group notifications for same call
-        subtitle: isVideoCall ? 'Video Call' : 'Voice Call',
+        subtitle: 'Voice Call', // Default to voice call
       );
       
-      const details = NotificationDetails(
+      final details = NotificationDetails(
         android: androidDetails,
         iOS: iosDetails,
       );
@@ -923,8 +927,9 @@ class _CallScreenState extends State<CallScreen> {
       await _notificationsPlugin.show(
         _notificationId,
         _currentCallTarget!, // Show caller name as title (WhatsApp-style)
-        'Incoming ${isVideoCall ? 'video' : 'voice'} call',
+        'Incoming voice call', // Default to voice call
         details,
+        payload: 'incoming_call_notification',
       );
       
       debugPrint('📱 Incoming call notification displayed successfully');

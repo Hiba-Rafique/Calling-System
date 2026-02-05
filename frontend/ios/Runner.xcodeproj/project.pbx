@@ -1,0 +1,49 @@
+// !$*UTF-8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	compatibilityVersion = "Xcode 14.0";
+	developmentRegion = en;
+	buildSettings = {
+		COMBINE_HIDPI_IMAGES = YES;
+		DEVELOPMENT_TEAM = "";
+		ENABLE_BITCODE = NO;
+		INFOPLIST_FILE = Runner/Info.plist;
+		INFOPLIST_KEY_CFBundleDisplayName = "Calling System";
+		INFOPLIST_KEY_CFBundleExecutable = "Runner";
+		INFOPLIST_KEY_CFBundleIdentifier = "com.example.frontend";
+		INFOPLIST_KEY_NSPrincipalClass = "Runner";
+		INFOPLIST_KEY_NSAppTransportSecurity = "NSAppTransportSecurity";
+		INFOPLIST_KEY_UIRequiredDeviceCapabilities = "full-screen";
+		INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait";
+		INFOPLIST_KEY_UISupportedInterfaceOrientations~ipad = "UIInterfaceOrientationPortrait";
+		INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+		INFOPLIST_KEY_UILaunchStoryboardName = "LaunchScreen";
+		INFOPLIST_KEY_UIMainStoryboardFile = "Main";
+		INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait";
+		INFOPLIST_KEY_UISupportedInterfaceOrientations~ipad = "UIInterfaceOrientationPortrait";
+		INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+		INFOPLIST_KEY_UILaunchStoryboardName = "LaunchScreen";
+		INFOPLIST_KEY_UIMainStoryboardFile = "Main";
+		INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait";
+		INFOPLIST_KEY_UISupportedInterfaceOrientations~ipad = "UIInterfaceOrientationPortrait";
+		INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+		INFOPLIST_KEY_UILaunchStoryboardName = "LaunchScreen";
+		INFOPLIST_KEY_UIMainStoryboardFile = "Main";
+		INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait";
+		INFOPLIST_KEY_UISupportedInterfaceOrientations~ipad = "UIInterfaceOrientationPortrait";
+		INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+		INFOPLIST_KEY_UILaunchStoryboardName = "LaunchScreen";
+		INFOPLIST_KEY_UIMainStoryboardFile = "Main";
+		INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait";
+		INFOPLIST_KEY_UISupportedInterfaceOrientations~ipad = "UIInterfaceOrientationPortrait";
+		INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+		INFOPLIST_KEY_UILaunchStoryboardName = "LaunchScreen";
+		INFOPLIST_KEY_UIMainStoryboardFile = "Main";
+	};
+	dependencies = {
+		productRef = "com.apple.productbuildtools";
+	};
+}

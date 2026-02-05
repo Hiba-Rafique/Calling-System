@@ -348,10 +348,31 @@ class _CallScreenState extends State<CallScreen> {
       
       await _notificationsPlugin.initialize(
         initSettings,
-        onDidReceiveNotificationResponse: (NotificationResponse response) {
-          // Handle notification tap
-        },
+        onDidReceiveNotificationResponse: _onNotificationResponse,
       );
+    }
+  }
+
+  void _onNotificationResponse(NotificationResponse response) {
+    debugPrint('📱 Notification response: ${response.payload}');
+    
+    if (response.payload != null && _currentCallTarget != null) {
+      final payload = response.payload!;
+      final action = payload['action'];
+      
+      if (action == 'answer_call') {
+        debugPrint('📱 Answer action tapped for $_currentCallTarget');
+        // Accept the call
+        _acceptIncomingCall();
+        // Clear the background notification
+        _notificationsPlugin.cancel(_notificationId);
+      } else if (action == 'decline_call') {
+        debugPrint('📱 Decline action tapped for $_currentCallTarget');
+        // Decline the call
+        _rejectIncomingCall();
+        // Clear the background notification
+        _notificationsPlugin.cancel(_notificationId);
+      }
     }
   }
 
@@ -844,16 +865,42 @@ class _CallScreenState extends State<CallScreen> {
   /// Show incoming call notification
   Future<void> _showIncomingCallNotification() async {
     if (!kIsWeb && _currentCallTarget != null) {
+      debugPrint('📱 Showing incoming call notification for $_currentCallTarget');
+      
       const androidDetails = AndroidNotificationDetails(
+        '@mipmap/ic_launcher',
         'incoming_calls',
-        'Incoming Calls',
-        channelDescription: 'Notifications for incoming calls',
-        importance: Importance.max,
+        channelDescription: 'Incoming call notifications',
+        importance: Importance.high,
         priority: Priority.high,
-        ongoing: true,
-        autoCancel: false,
-        category: AndroidNotificationCategory.call,
         fullScreenIntent: true,
+        enableVibration: true,
+        vibrationPattern: Int64List.fromList([0, 1000, 500, 1000]),
+        // Android-specific enhancements for background calls
+        category: AndroidNotificationCategory.call,
+        ongoing: false, // Allow user to dismiss
+        autoCancel: false, // Don't auto-cancel
+        visibility: NotificationVisibility.public,
+        sound: RawResourceAndroidNotificationSound('notification_ring'),
+        color: Color.fromARGB(255, 76, 175, 80), // WhatsApp green
+        icon: '@mipmap/ic_notification',
+        largeIcon: '@mipmap/ic_notification',
+        styleInformation: AndroidNotificationStyle.bigText('Call from $_currentCallTarget'),
+        // Add action buttons for background
+        actions: [
+          AndroidNotificationAction(
+            'answer_call',
+            'Answer',
+            AndroidNotificationAction.defaultAction,
+            showsUserInterface: true,
+          ),
+          AndroidNotificationAction(
+            'decline_call',
+            'Decline',
+            AndroidNotificationAction.defaultAction,
+            showsUserInterface: false,
+          ),
+        ],
       );
       
       const iosDetails = DarwinNotificationDetails(
@@ -861,6 +908,11 @@ class _CallScreenState extends State<CallScreen> {
         presentBadge: true,
         presentSound: true,
         categoryIdentifier: 'incoming_call',
+        // iOS-specific enhancements for background calls
+        interruptionLevel: InterruptionLevel.timeSensitive,
+        criticalAlert: true,
+        threadIdentifier: _currentCallTarget, // Group notifications for same call
+        subtitle: isVideoCall ? 'Video Call' : 'Voice Call',
       );
       
       const details = NotificationDetails(
@@ -870,10 +922,12 @@ class _CallScreenState extends State<CallScreen> {
 
       await _notificationsPlugin.show(
         _notificationId,
-        'Incoming Call',
-        'Call from $_currentCallTarget',
+        _currentCallTarget!, // Show caller name as title (WhatsApp-style)
+        'Incoming ${isVideoCall ? 'video' : 'voice'} call',
         details,
       );
+      
+      debugPrint('📱 Incoming call notification displayed successfully');
     }
   }
 

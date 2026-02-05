@@ -49,5 +49,23 @@
 	<string>This app needs camera access for video calling.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app needs microphone access for calling.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>background-fetch</string>
+		<string>remote-notification</string>
+		<string>voip</string>
+		<string>audio</string>
+	</array>
+	<key>UIUserNotificationType</key>
+	<array>
+		<string>alert</string>
+		<string>badge</string>
+		<string>sound</string>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

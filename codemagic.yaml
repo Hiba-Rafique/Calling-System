@@ -5,11 +5,16 @@ workflows:
     environment:
       flutter: stable
       xcode: latest
+      cocoapods: default
     scripts:
       - name: Change to frontend folder
         script: |
           cd frontend
           flutter pub get
+      - name: Install CocoaPods
+        script: |
+          cd frontend/ios
+          pod install --repo-update
       - name: Build iOS IPA
         script: |
           cd frontend

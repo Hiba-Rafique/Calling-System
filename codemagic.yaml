@@ -1,0 +1,18 @@
+workflows:
+  flutter-ios:
+    name: Flutter iOS
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      xcode: latest
+    scripts:
+      - name: Change to frontend folder
+        script: |
+          cd frontend
+          flutter pub get
+      - name: Build iOS IPA
+        script: |
+          cd frontend
+          flutter build ios --release --no-codesign
+    artifacts:
+      - frontend/build/ios/ipa/*.ipa
